@@ -1074,7 +1074,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...(output === undefined ? {} : { output }),
           },
         });
-        if (toolName === "subagent") {
+        if (toolName === "subagent" || isPiSubagentResult(resultRecord)) {
           yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
         }
       });
@@ -3160,6 +3160,26 @@ function piRollbackForkEntry(input: {
   if (ref == null) return null;
   if (ref.strength !== "strong" || ref.nativeId === null) return undefined;
   return ref.nativeId;
+}
+
+function nonBlankString(input: unknown, key: string): boolean {
+  const value = recordString(input, key);
+  return value !== undefined && value.trim().length > 0;
+}
+
+/**
+ * Pi's subagent extension reports each delegated run in `details.results`.
+ * A fork can register it under another tool name, so any tool whose result
+ * has that shape is a subagent call. Every entry must name its agent and task,
+ * which keeps ordinary `results` lists (search hits, batch output) out.
+ */
+function isPiSubagentResult(resultRecord: unknown): boolean {
+  const results = recordField(recordField(resultRecord, "details"), "results");
+  return (
+    Array.isArray(results) &&
+    results.length > 0 &&
+    results.every((result) => nonBlankString(result, "agent") && nonBlankString(result, "task"))
+  );
 }
 
 function piSubagentOutput(result: unknown): string {

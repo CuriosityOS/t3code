@@ -2375,6 +2375,124 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("maps a renamed subagent tool by its result shape", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_delegate",
+        toolName: "delegate",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "done" }],
+          details: {
+            mode: "parallel",
+            results: [
+              {
+                agent: "reviewer",
+                task: "review the diff",
+                exitCode: 0,
+                stopReason: "stop",
+                messages: [{ role: "assistant", content: [{ type: "text", text: "looks good" }] }],
+              },
+            ],
+          },
+        },
+      });
+      const card = yield* takeEvent((event) => event.type === "subagent.updated");
+      assert.isTrue(
+        card.type === "subagent.updated" &&
+          card.subagent.title === "reviewer" &&
+          card.subagent.prompt === "review the diff" &&
+          card.subagent.status === "completed" &&
+          card.subagent.result === "looks good",
+      );
+      const item = yield* takeEvent(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "subagent",
+      );
+      assert.isTrue(
+        item.type === "turn_item.updated" &&
+          item.turnItem.type === "subagent" &&
+          item.turnItem.title === "reviewer",
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps ordinary tools with a results list out of subagent cards", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const detailsCases: ReadonlyArray<unknown> = [
+        { results: [{ title: "Pi docs", url: "https://example.com" }] },
+        { results: [] },
+        { results: [{ agent: "scout", task: "map" }, { title: "stray" }] },
+        { results: [{ agent: "", task: "map" }] },
+        { results: [{ agent: "scout", task: "   " }] },
+        { results: [{ agent: "scout", task: 7 }] },
+        { results: { agent: "scout", task: "map" } },
+        { agent: "scout", task: "map" },
+      ];
+      for (const [index, details] of detailsCases.entries()) {
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: `call_plain_${index}`,
+          toolName: "web_search",
+          isError: false,
+          result: { content: [{ type: "text", text: "ok" }], details },
+        });
+      }
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_marker",
+        toolName: "marker",
+        isError: false,
+        result: { content: [{ type: "text", text: "after" }] },
+      });
+      const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+      yield* takeEvent((event) => {
+        seen.push(event);
+        return (
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.toolName === "marker"
+        );
+      });
+      assert.isFalse(
+        seen.some(
+          (event) =>
+            event.type === "subagent.updated" ||
+            (event.type === "turn_item.updated" && event.turnItem.type === "subagent"),
+        ),
+      );
+      assert.equal(
+        seen.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.toolName === "web_search",
+        ).length,
+        detailsCases.length,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("persists edit patches and write content on file change items", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
