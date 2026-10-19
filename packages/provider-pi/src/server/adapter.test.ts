@@ -1294,6 +1294,48 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("merges background work that several extensions report", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const report = (source: string, statusText: string | undefined) =>
+        fake.emit({
+          type: "extension_ui_request",
+          id: `status:${source}:${statusText}`,
+          method: "setStatus",
+          statusKey: `t3:background-tasks:${source}`,
+          ...(statusText === undefined ? {} : { statusText }),
+        });
+      const expectRoster = (expected: ReadonlyArray<unknown>) =>
+        takeEvent(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            JSON.stringify(event.providerThread.pendingBackgroundTasks) ===
+              JSON.stringify(expected),
+        );
+      yield* report("terminals", JSON.stringify([{ taskId: "1", description: "chrome build" }]));
+      yield* report("subagents", JSON.stringify([{ taskId: "1", description: "reviewer" }]));
+      yield* expectRoster([
+        { taskId: "terminals:1", kind: "background_task", description: "chrome build" },
+        { taskId: "subagents:1", kind: "background_task", description: "reviewer" },
+      ]);
+      // One source finishing leaves the other's work listed.
+      yield* report("terminals", undefined);
+      yield* expectRoster([
+        { taskId: "subagents:1", kind: "background_task", description: "reviewer" },
+      ]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* report("subagents", "[]");
+      yield* expectRoster([]);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("applies background work reported before its thread registers", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;

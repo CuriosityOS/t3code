@@ -1,7 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  mergePiBackgroundTasks,
   parsePiBackgroundTasks,
+  piBackgroundTasksSource,
   piBackgroundTasksEqual,
   piBackgroundTasksHoldSession,
 } from "./backgroundTasks.ts";
@@ -78,5 +80,30 @@ describe("pi background task rosters", () => {
         parsePiBackgroundTasks('[{"taskId":"watch","kind":"monitor"}]') ?? [],
       ),
     );
+  });
+});
+
+describe("pi background task sources", () => {
+  it("reads the source from a background-task status key", () => {
+    assert.strictEqual(piBackgroundTasksSource("t3:background-tasks"), "");
+    assert.strictEqual(piBackgroundTasksSource("t3:background-tasks:terminals"), "terminals");
+    assert.isNull(piBackgroundTasksSource("t3:background-tasksx"));
+    assert.isNull(piBackgroundTasksSource("subagents"));
+    assert.isNull(piBackgroundTasksSource(undefined));
+  });
+
+  it("merges every source's tasks under source-scoped ids", () => {
+    const merged = mergePiBackgroundTasks(
+      new Map([
+        ["terminals", parsePiBackgroundTasks('[{"taskId":"1","description":"build"}]') ?? []],
+        ["subagents", parsePiBackgroundTasks('[{"taskId":"1","kind":"monitor"}]') ?? []],
+        ["", parsePiBackgroundTasks('[{"taskId":"plain"}]') ?? []],
+      ]),
+    );
+    assert.deepEqual(merged, [
+      { taskId: "terminals:1", kind: "background_task", description: "build" },
+      { taskId: "subagents:1", kind: "monitor" },
+      { taskId: "plain", kind: "background_task" },
+    ]);
   });
 });

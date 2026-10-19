@@ -26,10 +26,11 @@ import {
 } from "@t3tools/contracts";
 import { PiSettings } from "../settings.ts";
 import {
+  mergePiBackgroundTasks,
   parsePiBackgroundTasks,
-  PI_BACKGROUND_TASKS_STATUS_KEY,
   piBackgroundTasksEqual,
   piBackgroundTasksHoldSession,
+  piBackgroundTasksSource,
 } from "./backgroundTasks.ts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -536,6 +537,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       let pendingWake: PiWake | null = null;
       // Process-wide: Pi runs one native session at a time, and its
       // extensions report the work still running in that session.
+      const backgroundTasksBySource = new Map<
+        string,
+        ReadonlyArray<OrchestrationV2PendingBackgroundTask>
+      >();
       let backgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask> = [];
       let registeringState: PiThreadState | null = null;
       let rollbackBarrier: Deferred.Deferred<
@@ -1647,25 +1652,30 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         yield* updateProviderThread(state, { pendingBackgroundTasks: backgroundTasks });
       });
 
-      const handleBackgroundTasksStatus = Effect.fnUntraced(function* (event: PiRpcRecord) {
+      const handleBackgroundTasksStatus = Effect.fnUntraced(function* (
+        source: string,
+        event: PiRpcRecord,
+      ) {
         const tasks = parsePiBackgroundTasks(recordString(event, "statusText"));
         if (tasks === null) {
-          yield* Effect.logWarning("Ignoring malformed pi background task status.");
+          yield* Effect.logWarning("Ignoring malformed pi background task status.", { source });
           return;
         }
-        backgroundTasks = tasks;
+        if (tasks.length === 0) backgroundTasksBySource.delete(source);
+        else backgroundTasksBySource.set(source, tasks);
+        backgroundTasks = mergePiBackgroundTasks(backgroundTasksBySource);
         // Before or during registration, registerThread applies the list.
         if (threadState !== null && threadState !== registeringState)
           yield* publishBackgroundTasks(threadState);
       });
 
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
-        if (
-          event["type"] === "extension_ui_request" &&
-          event["method"] === "setStatus" &&
-          event["statusKey"] === PI_BACKGROUND_TASKS_STATUS_KEY
-        ) {
-          return yield* handleBackgroundTasksStatus(event);
+        const backgroundTasksSource =
+          event["type"] === "extension_ui_request" && event["method"] === "setStatus"
+            ? piBackgroundTasksSource(event["statusKey"])
+            : null;
+        if (backgroundTasksSource !== null) {
+          return yield* handleBackgroundTasksStatus(backgroundTasksSource, event);
         }
         // Model-selection hooks can await a dialog before startTurn can claim
         // a wake. Keep interactive requests session-scoped until a turn owns
@@ -2211,7 +2221,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (resumeId != null || needsNewSession) {
           // Another native session has its own background work, which its
           // extensions report again once the switch lands.
-          if (resumeId == null || resumeId !== lastNativeThreadId) backgroundTasks = [];
+          if (resumeId == null || resumeId !== lastNativeThreadId) {
+            backgroundTasksBySource.clear();
+            backgroundTasks = [];
+          }
           lastNativeThreadId = resumeId ?? lastNativeThreadId;
           // Even a failed lifecycle operation can change Pi's native session.
           // Never leave the old app binding or model defaults usable afterward.

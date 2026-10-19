@@ -3,13 +3,23 @@ import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2Pe
 
 /**
  * Pi has no RPC event for background work, so extensions report it through
- * `ctx.ui.setStatus(PI_BACKGROUND_TASKS_STATUS_KEY, json)`. The text is a JSON
- * array of `{ taskId, kind?, description? }` for work still running in the
- * session; an empty array or a cleared status means none. `kind` is
+ * `ctx.ui.setStatus("t3:background-tasks:<source>", json)`, one key per
+ * extension so their reports do not replace each other (a bare
+ * `t3:background-tasks` is the empty source). The text is a JSON array of
+ * `{ taskId, kind?, description? }` for that source's work still running in
+ * the session; an empty array or a cleared status means none. `kind` is
  * `background_task` (default) or `monitor` for work the agent will be woken
  * by, and `command` for work it does not wait on, such as a dev server.
  */
 export const PI_BACKGROUND_TASKS_STATUS_KEY = "t3:background-tasks";
+
+/** The reporting source for a background-task status key, else null. */
+export function piBackgroundTasksSource(statusKey: unknown): string | null {
+  if (statusKey === PI_BACKGROUND_TASKS_STATUS_KEY) return "";
+  if (typeof statusKey !== "string" || !statusKey.startsWith(`${PI_BACKGROUND_TASKS_STATUS_KEY}:`))
+    return null;
+  return statusKey.slice(PI_BACKGROUND_TASKS_STATUS_KEY.length + 1);
+}
 
 const MAX_TASKS = 50;
 const MAX_DESCRIPTION_LENGTH = 200;
@@ -48,6 +58,24 @@ export function parsePiBackgroundTasks(
     if (tasks.length === MAX_TASKS) break;
   }
   return tasks;
+}
+
+/** One roster from every source's report, in report order. */
+export function mergePiBackgroundTasks(
+  bySource: ReadonlyMap<string, ReadonlyArray<OrchestrationV2PendingBackgroundTask>>,
+): ReadonlyArray<OrchestrationV2PendingBackgroundTask> {
+  const merged: OrchestrationV2PendingBackgroundTask[] = [];
+  const seen = new Set<string>();
+  for (const [source, tasks] of bySource) {
+    for (const task of tasks) {
+      const taskId = source.length === 0 ? task.taskId : `${source}:${task.taskId}`;
+      if (seen.has(taskId)) continue;
+      seen.add(taskId);
+      merged.push({ ...task, taskId });
+      if (merged.length === MAX_TASKS) return merged;
+    }
+  }
+  return merged;
 }
 
 export function piBackgroundTasksEqual(
