@@ -50,6 +50,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { parsePiCompactCommand, type PiCompactCommand } from "./commands.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -80,6 +81,7 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import { makePiRpcProtocolLogger } from "./nativeLogging.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -205,6 +207,7 @@ export interface PiAdapterV2Options {
       request: ProviderContinuationRequests.ProviderContinuationRequest,
     ) => Effect.Effect<void>;
   };
+  readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
 }
 
 function contentText(content: unknown): string {
@@ -489,11 +492,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         threadId: input.threadId,
         env: launch.env,
       });
+      const logFrame = makePiRpcProtocolLogger({
+        nativeEventLogger: options.nativeEventLogger,
+        providerInstanceId: options.instanceId,
+        providerSessionId: input.providerSessionId,
+        threadId: input.threadId,
+      });
       const connection: PiRpcConnection = yield* makePiRpcConnection({
         command: scopedLaunch.command,
         args: scopedLaunch.args,
         cwd,
         env: launch.env,
+        ...(logFrame === undefined ? {} : { onFrame: logFrame }),
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.mapError(
@@ -1080,7 +1090,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...(output === undefined ? {} : { output }),
           },
         });
-        if (toolName === "subagent") {
+        if (toolName === "subagent" || isPiSubagentResult(resultRecord)) {
           yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
         }
       });
@@ -1229,11 +1239,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (method === "notify") {
           const state = threadState;
           const turn = state?.activeTurn ?? null;
-          const message = recordString(event, "message") ?? "";
+          const message = recordString(event, "message")?.trim() ?? "";
           if (turn === null || message.length === 0) return;
           const emittedAt = yield* DateTime.now;
           const nativeItemId = `notify:${turn.nextItemOrdinal}`;
           yield* emitItemNode(turn, nativeItemId, "system", "completed", emittedAt, emittedAt);
+          // A notice row shows the text itself; a tool item would read "notify"
+          // and fold into the turn's tool calls. The contract has no severity
+          // field, so every notifyType renders as the same notice.
           yield* emit({
             type: "turn_item.updated",
             driver: PI_PROVIDER,
@@ -1241,13 +1254,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
               status: "completed",
               completedAt: emittedAt,
-              title: "notify",
-              type: "dynamic_tool",
-              toolName: "notify",
-              input: {
-                message,
-                notifyType: recordString(event, "notifyType") ?? "info",
-              },
+              title: message,
+              type: "system_notice",
+              message,
             },
           });
           return;
@@ -3078,11 +3087,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             });
             const nativeId = yield* Effect.scoped(
               Effect.gen(function* () {
+                const logForkFrame = makePiRpcProtocolLogger({
+                  nativeEventLogger: options.nativeEventLogger,
+                  providerInstanceId: options.instanceId,
+                  providerSessionId: input.providerSessionId,
+                  threadId: forkInput.targetThreadId,
+                });
                 const forkConnection = yield* makePiRpcConnection({
                   command: options.settings.binaryPath || "pi",
                   args: [...forkLaunch.args, "--fork", sourceFile],
                   cwd,
                   env: forkLaunch.env,
+                  ...(logForkFrame === undefined ? {} : { onFrame: logForkFrame }),
                 });
                 yield* Stream.fromQueue(forkConnection.events).pipe(
                   Stream.runDrain,
@@ -3224,6 +3240,26 @@ function piRollbackForkEntry(input: {
   return ref.nativeId;
 }
 
+function nonBlankString(input: unknown, key: string): boolean {
+  const value = recordString(input, key);
+  return value !== undefined && value.trim().length > 0;
+}
+
+/**
+ * Pi's subagent extension reports each delegated run in `details.results`.
+ * A fork can register it under another tool name, so any tool whose result
+ * has that shape is a subagent call. Every entry must name its agent and task,
+ * which keeps ordinary `results` lists (search hits, batch output) out.
+ */
+function isPiSubagentResult(resultRecord: unknown): boolean {
+  const results = recordField(recordField(resultRecord, "details"), "results");
+  return (
+    Array.isArray(results) &&
+    results.length > 0 &&
+    results.every((result) => nonBlankString(result, "agent") && nonBlankString(result, "task"))
+  );
+}
+
 function piSubagentOutput(result: unknown): string {
   const stopReason = recordString(result, "stopReason");
   const failed =
@@ -3310,6 +3346,7 @@ export type PiAdapterV2DriverEnv =
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | McpProviderSessions.McpProviderSessions
+  | ProviderEventLoggers.ProviderEventLoggers
   | ProviderHost.ProviderHost;
 
 export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2DriverEnv> = {
@@ -3320,11 +3357,15 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
     function* (input: ProviderAdapterDriverCreateInput<PiSettings>) {
       const hostEnvironment = yield* HostProcess.Environment;
       const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makePiAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
         environment: yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
         continuationRequests,
+        ...(providerEventLoggers.native === undefined
+          ? {}
+          : { nativeEventLogger: providerEventLoggers.native }),
       });
     },
     (effect, input) =>
@@ -3348,11 +3389,15 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
     Effect.gen(function* () {
       const hostEnvironment = yield* HostProcess.Environment;
       const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makePiAdapterV2({
         instanceId: PI_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_PI_SETTINGS,
         environment: hostEnvironment,
         continuationRequests,
+        ...(providerEventLoggers.native === undefined
+          ? {}
+          : { nativeEventLogger: providerEventLoggers.native }),
       });
     }),
   );

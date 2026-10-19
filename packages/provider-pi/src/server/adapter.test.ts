@@ -35,6 +35,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { handoffBudget } from "@t3tools/provider-core/server/handoffBudget";
@@ -350,6 +351,10 @@ const makeAdapter = Effect.fnUntraced(function* (
         ...continuationRequests,
         take: Effect.never,
       }),
+      Effect.provideService(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
     );
   }
   return yield* makePiAdapterV2({
@@ -1113,8 +1118,8 @@ describe("PiAdapterV2", () => {
         yield* takeEvent(
           (event) =>
             event.type === "turn_item.updated" &&
-            event.turnItem.type === "dynamic_tool" &&
-            event.turnItem.toolName === "notify",
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "Ordering barrier",
         );
         assert.equal(runtime.providerSession.status, "running");
         fake.queueState({ isStreaming: true });
@@ -1483,6 +1488,111 @@ describe("PiAdapterV2", () => {
       assert.equal(spawn.env.T3_MCP_URL, "http://127.0.0.1:43123/mcp");
       assert.equal(spawn.env.T3_MCP_BEARER_TOKEN, "secret-pi-token");
       assert.equal(spawn.env.T3_PI_RUNTIME_MODE, "full-access");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("writes the session's RPC frames to the thread's native event log", () =>
+    Effect.gen(function* () {
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-pi-log"),
+        threadId: THREAD_ID,
+        providerSessionId: "mcp-session-pi-log",
+        providerInstanceId: PI_INSTANCE_ID,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer secret-pi-token",
+        browserToolsAvailable: false,
+      });
+      const fake = yield* makeFakePi;
+      const writes: Array<{ readonly event: unknown; readonly threadId: ThreadId | null }> = [];
+      const adapter = yield* PiAdapterV2Driver.create({
+        instanceId: PI_INSTANCE_ID,
+        displayName: undefined,
+        enabled: true,
+        environment: [],
+        config: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner),
+        Effect.provideService(HostProcess.Environment, { PI_TEST_API_KEY: "sk-env-secret" }),
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: () => Effect.void,
+          take: Effect.never,
+        }),
+        Effect.provideService(ProviderEventLoggers.ProviderEventLoggers, {
+          native: {
+            filePath: "/logs/provider/events.log",
+            write: (event, threadId) => Effect.sync(() => void writes.push({ event, threadId })),
+            close: () => Effect.void,
+          },
+          canonical: undefined,
+        }),
+      );
+      const runtime = yield* adapter.openSession({
+        threadId: THREAD_ID,
+        providerSessionId: SESSION_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(emitted, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Streamed reply" },
+      });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Streamed reply" },
+      });
+      yield* fake.emit({ type: "agent_settled" });
+      while ((yield* Queue.take(emitted)).type !== "turn.terminal") {}
+
+      assert.isTrue(writes.length > 0);
+      assert.isTrue(writes.every((write) => write.threadId === THREAD_ID));
+      const frames = writes.map(
+        (write) =>
+          (write.event as { readonly event: Record<string, unknown> }).event as {
+            readonly direction: string;
+            readonly method: string;
+            readonly command?: string;
+            readonly assistantEvent?: string;
+          },
+      );
+      const has = (
+        direction: string,
+        method: string,
+        extra?: (frame: (typeof frames)[0]) => boolean,
+      ) =>
+        frames.some(
+          (frame) =>
+            frame.direction === direction && frame.method === method && (extra?.(frame) ?? true),
+        );
+      assert.isTrue(has("outgoing", "get_state"));
+      assert.isTrue(has("outgoing", "prompt"));
+      assert.isTrue(has("incoming", "response", (frame) => frame.command === "get_state"));
+      assert.isTrue(has("incoming", "agent_start"));
+      assert.isTrue(
+        has("incoming", "message_update", (frame) => frame.assistantEvent === "text_end"),
+      );
+      assert.isFalse(frames.some((frame) => frame.assistantEvent === "text_delta"));
+      assert.include(writes[0]!.event as object, {
+        provider: PI_PROVIDER,
+        protocol: "pi.rpc-jsonl",
+        providerSessionId: SESSION_ID,
+      });
+      const serialized = JSON.stringify(writes);
+      for (const secret of ["secret-pi-token", "sk-env-secret", "Hello pi", "Streamed reply"]) {
+        assert.notInclude(serialized, secret);
+      }
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -2381,6 +2491,184 @@ describe("PiAdapterV2", () => {
         subagentItem.type === "turn_item.updated" &&
           subagentItem.turnItem.type === "subagent" &&
           subagentItem.turnItem.childThreadId === null,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("shows extension notifications as notices carrying their text", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const notifications = [
+        { notifyType: "info", message: "Indexed 42 files" },
+        { notifyType: "warning", message: "t3-code MCP unavailable" },
+        { notifyType: "error", message: "Extension crashed" },
+        { message: "  Untyped notice  " },
+      ];
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "ui-blank",
+        method: "notify",
+        message: "   ",
+        notifyType: "info",
+      });
+      for (const [index, notification] of notifications.entries()) {
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: `ui-notify-${index}`,
+          method: "notify",
+          ...notification,
+        });
+      }
+      const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+      for (const expected of [
+        "Indexed 42 files",
+        "t3-code MCP unavailable",
+        "Extension crashed",
+        "Untyped notice",
+      ]) {
+        const notice = yield* takeEvent((event) => {
+          seen.push(event);
+          return event.type === "turn_item.updated" && event.turnItem.type === "system_notice";
+        });
+        assert.isTrue(
+          notice.type === "turn_item.updated" &&
+            notice.turnItem.type === "system_notice" &&
+            notice.turnItem.message === expected &&
+            notice.turnItem.title === expected &&
+            notice.turnItem.status === "completed",
+        );
+      }
+      assert.isFalse(
+        seen.some(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("maps a renamed subagent tool by its result shape", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_delegate",
+        toolName: "delegate",
+        isError: false,
+        result: {
+          content: [{ type: "text", text: "done" }],
+          details: {
+            mode: "parallel",
+            results: [
+              {
+                agent: "reviewer",
+                task: "review the diff",
+                exitCode: 0,
+                stopReason: "stop",
+                messages: [{ role: "assistant", content: [{ type: "text", text: "looks good" }] }],
+              },
+            ],
+          },
+        },
+      });
+      const card = yield* takeEvent((event) => event.type === "subagent.updated");
+      assert.isTrue(
+        card.type === "subagent.updated" &&
+          card.subagent.title === "reviewer" &&
+          card.subagent.prompt === "review the diff" &&
+          card.subagent.status === "completed" &&
+          card.subagent.result === "looks good",
+      );
+      const item = yield* takeEvent(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "subagent",
+      );
+      assert.isTrue(
+        item.type === "turn_item.updated" &&
+          item.turnItem.type === "subagent" &&
+          item.turnItem.title === "reviewer",
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps ordinary tools with a results list out of subagent cards", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const detailsCases: ReadonlyArray<unknown> = [
+        { results: [{ title: "Pi docs", url: "https://example.com" }] },
+        { results: [] },
+        { results: [{ agent: "scout", task: "map" }, { title: "stray" }] },
+        { results: [{ agent: "", task: "map" }] },
+        { results: [{ agent: "scout", task: "   " }] },
+        { results: [{ agent: "scout", task: 7 }] },
+        { results: { agent: "scout", task: "map" } },
+        { agent: "scout", task: "map" },
+      ];
+      for (const [index, details] of detailsCases.entries()) {
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: `call_plain_${index}`,
+          toolName: "web_search",
+          isError: false,
+          result: { content: [{ type: "text", text: "ok" }], details },
+        });
+      }
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call_marker",
+        toolName: "marker",
+        isError: false,
+        result: { content: [{ type: "text", text: "after" }] },
+      });
+      const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+      yield* takeEvent((event) => {
+        seen.push(event);
+        return (
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.toolName === "marker"
+        );
+      });
+      assert.isFalse(
+        seen.some(
+          (event) =>
+            event.type === "subagent.updated" ||
+            (event.type === "turn_item.updated" && event.turnItem.type === "subagent"),
+        ),
+      );
+      assert.equal(
+        seen.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.toolName === "web_search",
+        ).length,
+        detailsCases.length,
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
