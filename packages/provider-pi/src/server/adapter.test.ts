@@ -64,6 +64,7 @@ const PI_INSTANCE_ID = ProviderInstanceId.make("pi");
 const THREAD_ID = ThreadId.make("thread-pi-test");
 const SESSION_ID = ProviderSessionId.make("provider-session-pi-test");
 const FAKE_SESSION_FILE = "/fake/.pi/agent/sessions/--workspace--/0001_abc.jsonl";
+const OTHER_SESSION_FILE = "/fake/.pi/agent/sessions/--workspace--/0002_def.jsonl";
 /** Deliberately outside the valid pid range so a group-kill can never land. */
 const FAKE_PID = 999_999_999;
 
@@ -78,11 +79,22 @@ const modelSelection = (model: string): ModelSelection => ({
   model,
 });
 
+/** The same provider thread bound to another native session file. */
+const inSessionFile = (
+  providerThread: OrchestrationV2ProviderThread,
+  sessionFile: string,
+): OrchestrationV2ProviderThread => ({
+  ...providerThread,
+  nativeThreadRef: { driver: PI_PROVIDER, nativeId: sessionFile, strength: "strong" },
+});
+
 interface FakePi {
   readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly emit: (record: PiRpcRecord, chunkBytes?: number) => Effect.Effect<void>;
   readonly takeRequest: (type: string) => Effect.Effect<PiRpcRecord>;
   readonly queueEntries: (data: unknown) => void;
+  /** Rejects `get_entries` with `since` the way Pi does for an unknown entry. */
+  readonly rejectEntriesSince: () => void;
   readonly queueMessages: (data: unknown) => void;
   readonly vetoNextSwitch: () => void;
   readonly queueState: (data: Record<string, unknown>) => void;
@@ -134,6 +146,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let failState = false;
   let vetoSwitch = false;
   let vetoNewSession = false;
+  let rejectSince = false;
   let deferredLifecycle: string | undefined;
   let sessionFile = FAKE_SESSION_FILE;
   let sessionGeneration = 0;
@@ -197,12 +210,16 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         return { ...base, data: { cancelled } };
       }
       case "get_entries":
+        if (rejectSince && record["since"] !== undefined) {
+          return { ...base, success: false, error: `Entry not found: ${String(record["since"])}` };
+        }
         return { ...base, data: entriesQueue.shift() ?? { entries: [], leafId: null } };
       case "get_messages":
         return { ...base, data: messagesQueue.shift() ?? { messages: [] } };
       case "get_session_stats":
         return { ...base, data: statsQueue.shift() ?? {} };
       case "fork":
+        sessionFile = `/fake/fork-${++sessionGeneration}.jsonl`;
         return { ...base, data: { text: "Hello pi", cancelled: false } };
       default:
         return base;
@@ -221,6 +238,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         const record = decodeJsonLine(line) as PiRpcRecord;
         allRequests.push(record);
         yield* Queue.offer(requests, record);
+        if (record["type"] === "switch_session" && !vetoSwitch) {
+          sessionFile = String(record["sessionPath"]);
+        }
         if (record["type"] === "get_state" && deferState) {
           deferState = false;
           deferredStateRequest = record;
@@ -276,6 +296,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     emit,
     takeRequest,
     queueEntries: (data) => entriesQueue.push(data),
+    rejectEntriesSince: () => {
+      rejectSince = true;
+    },
     queueMessages: (data) => messagesQueue.push(data),
     deferNextState: () => {
       deferState = true;
@@ -1393,7 +1416,9 @@ describe("PiAdapterV2", () => {
         runtimePolicy,
       });
       fake.deferNextLifecycle("switch_session");
-      const resumed = yield* runtime.resumeThread({ providerThread }).pipe(Effect.forkChild);
+      const resumed = yield* runtime
+        .resumeThread({ providerThread: inSessionFile(providerThread, OTHER_SESSION_FILE) })
+        .pipe(Effect.forkChild);
       const request = yield* fake.takeRequest("switch_session");
       yield* TestClock.adjust(Duration.millis(16_820));
       yield* fake.emit({
@@ -1403,9 +1428,10 @@ describe("PiAdapterV2", () => {
         success: true,
         data: { cancelled: false },
       });
-      assert.equal((yield* Fiber.join(resumed)).nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
+      const resumedThread = yield* Fiber.join(resumed);
+      assert.equal(resumedThread.nativeThreadRef?.nativeId, OTHER_SESSION_FILE);
       assert.isFalse(fake.allRequests().some((request) => request.type === "new_session"));
-      yield* startTurn(runtime, providerThread, "default");
+      yield* startTurn(runtime, resumedThread, "default");
       yield* fake.takeRequest("prompt");
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -1420,7 +1446,9 @@ describe("PiAdapterV2", () => {
         runtimePolicy,
       });
       fake.vetoNextSwitch();
-      yield* runtime.resumeThread({ providerThread }).pipe(Effect.flip);
+      yield* runtime
+        .resumeThread({ providerThread: inSessionFile(providerThread, OTHER_SESSION_FILE) })
+        .pipe(Effect.flip);
       const replacement = yield* runtime.ensureThread({
         threadId: THREAD_ID,
         modelSelection: modelSelection("default"),
@@ -1483,7 +1511,7 @@ describe("PiAdapterV2", () => {
       });
       fake.deferNextLifecycle("switch_session");
       const resumed = yield* runtime
-        .resumeThread({ providerThread })
+        .resumeThread({ providerThread: inSessionFile(providerThread, OTHER_SESSION_FILE) })
         .pipe(Effect.flip, Effect.forkChild);
       const request = yield* fake.takeRequest("switch_session");
       yield* TestClock.adjust(Duration.seconds(60));
@@ -1601,7 +1629,9 @@ describe("PiAdapterV2", () => {
         runtimePolicy,
       });
       fake.deferNextLifecycle("switch_session");
-      const resumed = yield* runtime.resumeThread({ providerThread }).pipe(Effect.forkChild);
+      const resumed = yield* runtime
+        .resumeThread({ providerThread: inSessionFile(providerThread, OTHER_SESSION_FILE) })
+        .pipe(Effect.forkChild);
       yield* fake.takeRequest("switch_session");
       yield* Fiber.interrupt(resumed);
       yield* takeEvent(
@@ -1619,6 +1649,238 @@ describe("PiAdapterV2", () => {
       assert.isFalse(fake.allRequests().some((request) => request.type === "new_session"));
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
+
+  describe("resuming the session this process already hosts", () => {
+    const thinkingSelection = (model: string, thinking: string): ModelSelection => ({
+      instanceId: PI_INSTANCE_ID,
+      model,
+      options: [{ id: "thinking", value: thinking }],
+    });
+    const headRef = (nativeId: string) =>
+      ({ driver: PI_PROVIDER, nativeId, strength: "strong" }) as const;
+
+    /** Opens a session and completes one turn on `anthropic/a` at high thinking. */
+    const afterFirstTurn = Effect.fnUntraced(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(
+        runtime,
+        providerThread,
+        "default",
+        [],
+        "Hello pi",
+        thinkingSelection("anthropic/a", "high"),
+      );
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      const requestsSince = (start: number) => fake.allRequests().slice(start);
+      return { fake, runtime, takeEvent, providerThread, requestsSince };
+    });
+
+    it.effect.each([
+      { change: "model", next: thinkingSelection("anthropic/b", "high"), sent: ["set_model"] },
+      {
+        change: "thinking",
+        next: thinkingSelection("anthropic/a", "low"),
+        sent: ["set_thinking_level"],
+      },
+    ])("skips the session reload when only the $change changes", ({ next, sent }) =>
+      Effect.gen(function* () {
+        const { fake, runtime, providerThread, requestsSince } = yield* afterFirstTurn();
+        const start = fake.allRequests().length;
+        // Pi still reports what T3 applied on the first turn.
+        fake.queueState({
+          model: { provider: "anthropic", id: "a" },
+          thinkingLevel: "high",
+          sessionName: "Pi test thread",
+        });
+        const resumed = yield* runtime.resumeThread({
+          providerThread,
+          modelSelection: next,
+          runtimePolicy,
+        });
+        assert.equal(resumed.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
+        assert.equal(resumed.id, providerThread.id);
+        yield* startTurn(runtime, resumed, "default", [], "Again", next, 2);
+        yield* fake.takeRequest("prompt");
+        assert.deepEqual(
+          requestsSince(start).map((request) => request.type),
+          ["get_state", ...sent, "prompt"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+
+    it.effect("resends a selection Pi no longer reports", () =>
+      Effect.gen(function* () {
+        const { fake, runtime, providerThread, requestsSince } = yield* afterFirstTurn();
+        const start = fake.allRequests().length;
+        // An extension moved Pi to another model behind T3's back.
+        fake.queueState({
+          model: { provider: "openai", id: "other" },
+          thinkingLevel: "high",
+          sessionName: "Pi test thread",
+        });
+        const selection = thinkingSelection("anthropic/a", "high");
+        const resumed = yield* runtime.resumeThread({
+          providerThread,
+          modelSelection: selection,
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, resumed, "default", [], "Again", selection, 2);
+        yield* fake.takeRequest("prompt");
+        const requests = requestsSince(start);
+        assert.deepEqual(
+          requests.map((request) => request.type),
+          ["get_state", "set_model", "prompt"],
+        );
+        assert.equal(requests[1]?.["modelId"], "a");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+
+    it.effect("switches and reapplies everything when the session differs", () =>
+      Effect.gen(function* () {
+        const { fake, runtime, providerThread, requestsSince } = yield* afterFirstTurn();
+        const start = fake.allRequests().length;
+        const selection = thinkingSelection("anthropic/a", "high");
+        const resumed = yield* runtime.resumeThread({
+          providerThread: {
+            ...inSessionFile(providerThread, OTHER_SESSION_FILE),
+            nativeConversationHeadRef: headRef("other-leaf"),
+          },
+          modelSelection: selection,
+          runtimePolicy,
+        });
+        assert.equal(resumed.nativeThreadRef?.nativeId, OTHER_SESSION_FILE);
+        yield* startTurn(runtime, resumed, "default", [], "Again", selection, 2);
+        yield* fake.takeRequest("prompt");
+        const requests = requestsSince(start);
+        assert.equal(requests[0]?.type, "switch_session");
+        assert.equal(requests[0]?.["sessionPath"], OTHER_SESSION_FILE);
+        // The two reads share a round trip, so their order is not fixed.
+        assert.sameMembers(
+          requests.slice(1, 3).map((request) => request.type),
+          ["get_state", "get_entries"],
+        );
+        // Only the leaf is needed: the known head bounds the listing.
+        assert.equal(
+          requests.find((request) => request.type === "get_entries")?.["since"],
+          "other-leaf",
+        );
+        assert.deepEqual(
+          requests.slice(3).map((request) => request.type),
+          ["set_model", "set_thinking_level", "set_session_name", "prompt"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+
+    it.effect("lists the whole tree when Pi does not know the resumed head", () =>
+      Effect.gen(function* () {
+        const { fake, runtime, providerThread, requestsSince } = yield* afterFirstTurn();
+        const start = fake.allRequests().length;
+        fake.rejectEntriesSince();
+        fake.queueEntries({ entries: [], leafId: "other-leaf" });
+        yield* runtime.resumeThread({
+          providerThread: {
+            ...inSessionFile(providerThread, OTHER_SESSION_FILE),
+            nativeConversationHeadRef: headRef("stale-leaf"),
+          },
+        });
+        assert.deepEqual(
+          requestsSince(start)
+            .filter((request) => request.type === "get_entries")
+            .map((request) => request["since"]),
+          ["stale-leaf", undefined],
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+
+    it.effect("switches when Pi reports a different session file than the binding", () =>
+      Effect.gen(function* () {
+        const { fake, runtime, providerThread, requestsSince } = yield* afterFirstTurn();
+        const start = fake.allRequests().length;
+        // An extension command replaced Pi's session during the last turn.
+        fake.queueState({ sessionFile: OTHER_SESSION_FILE });
+        const resumed = yield* runtime.resumeThread({ providerThread });
+        assert.equal(resumed.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
+        const requests = requestsSince(start);
+        assert.equal(requests[0]?.type, "get_state");
+        assert.equal(requests[1]?.type, "switch_session");
+        assert.equal(requests[1]?.["sessionPath"], FAKE_SESSION_FILE);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+
+    it.effect("reloads a rolled-back session through the full path", () =>
+      Effect.gen(function* () {
+        const { fake, runtime, takeEvent, providerThread, requestsSince } = yield* afterFirstTurn();
+        const turn = (ordinal: number): OrchestrationV2ProviderTurn => ({
+          id: ProviderTurnId.make(`turn-${ordinal}`),
+          providerThreadId: providerThread.id,
+          nodeId: NodeId.make(`node-${ordinal}`),
+          runAttemptId: null,
+          nativeTurnRef: headRef(`u${ordinal}`),
+          ordinal,
+          status: "completed",
+          startedAt: null,
+          completedAt: null,
+        });
+        const rolledBack = yield* runtime.rollbackThread({
+          providerThread,
+          target: {
+            type: "provider_turn",
+            checkpointId: CheckpointId.make("checkpoint-1"),
+            appRunOrdinal: 1,
+            providerTurn: turn(1),
+          },
+          providerThreadTurns: [turn(1), turn(2)],
+        });
+        const forkFile = rolledBack.providerThread.nativeThreadRef?.nativeId;
+        assert.match(String(forkFile), /^\/fake\/fork-/);
+        const start = fake.allRequests().length;
+        const selection = thinkingSelection("anthropic/a", "high");
+        const resumed = yield* runtime.resumeThread({
+          providerThread: rolledBack.providerThread,
+          modelSelection: selection,
+          runtimePolicy,
+        });
+        assert.equal(resumed.nativeThreadRef?.nativeId, forkFile);
+        yield* startTurn(runtime, resumed, "default", [], "Again", selection, 2);
+        yield* fake.takeRequest("prompt");
+        const requests = requestsSince(start);
+        // Pi already sits on the fork, but a rollback still reloads it.
+        assert.equal(requests[0]?.type, "switch_session");
+        assert.equal(requests[0]?.["sessionPath"], forkFile);
+        assert.deepEqual(
+          requests.slice(3).map((request) => request.type),
+          ["set_model", "set_thinking_level", "set_session_name", "prompt"],
+        );
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        // Later selection changes on the reloaded fork skip the reload again.
+        const afterTurn = fake.allRequests().length;
+        const resumedAgain = yield* runtime.resumeThread({
+          providerThread: resumed,
+          modelSelection: thinkingSelection("anthropic/b", "high"),
+          runtimePolicy,
+        });
+        assert.equal(resumedAgain.nativeThreadRef?.nativeId, forkFile);
+        assert.isFalse(
+          requestsSince(afterTurn).some(
+            (request) => request.type === "switch_session" || request.type === "get_entries",
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    );
+  });
 
   it.effect("budgets legacy native history with Pi's selected model capacity", () =>
     Effect.gen(function* () {
