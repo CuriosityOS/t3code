@@ -1118,8 +1118,8 @@ describe("PiAdapterV2", () => {
         yield* takeEvent(
           (event) =>
             event.type === "turn_item.updated" &&
-            event.turnItem.type === "dynamic_tool" &&
-            event.turnItem.toolName === "notify",
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "Ordering barrier",
         );
         assert.equal(runtime.providerSession.status, "running");
         fake.queueState({ isStreaming: true });
@@ -2371,6 +2371,66 @@ describe("PiAdapterV2", () => {
         subagentItem.type === "turn_item.updated" &&
           subagentItem.turnItem.type === "subagent" &&
           subagentItem.turnItem.childThreadId === null,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("shows extension notifications as notices carrying their text", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      const notifications = [
+        { notifyType: "info", message: "Indexed 42 files" },
+        { notifyType: "warning", message: "t3-code MCP unavailable" },
+        { notifyType: "error", message: "Extension crashed" },
+        { message: "  Untyped notice  " },
+      ];
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "ui-blank",
+        method: "notify",
+        message: "   ",
+        notifyType: "info",
+      });
+      for (const [index, notification] of notifications.entries()) {
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: `ui-notify-${index}`,
+          method: "notify",
+          ...notification,
+        });
+      }
+      const seen: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+      for (const expected of [
+        "Indexed 42 files",
+        "t3-code MCP unavailable",
+        "Extension crashed",
+        "Untyped notice",
+      ]) {
+        const notice = yield* takeEvent((event) => {
+          seen.push(event);
+          return event.type === "turn_item.updated" && event.turnItem.type === "system_notice";
+        });
+        assert.isTrue(
+          notice.type === "turn_item.updated" &&
+            notice.turnItem.type === "system_notice" &&
+            notice.turnItem.message === expected &&
+            notice.turnItem.title === expected &&
+            notice.turnItem.status === "completed",
+        );
+      }
+      assert.isFalse(
+        seen.some(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        ),
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );

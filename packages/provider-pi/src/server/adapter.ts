@@ -1223,11 +1223,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (method === "notify") {
           const state = threadState;
           const turn = state?.activeTurn ?? null;
-          const message = recordString(event, "message") ?? "";
+          const message = recordString(event, "message")?.trim() ?? "";
           if (turn === null || message.length === 0) return;
           const emittedAt = yield* DateTime.now;
           const nativeItemId = `notify:${turn.nextItemOrdinal}`;
           yield* emitItemNode(turn, nativeItemId, "system", "completed", emittedAt, emittedAt);
+          // A notice row shows the text itself; a tool item would read "notify"
+          // and fold into the turn's tool calls. The contract has no severity
+          // field, so every notifyType renders as the same notice.
           yield* emit({
             type: "turn_item.updated",
             driver: PI_PROVIDER,
@@ -1235,13 +1238,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ...baseItemFields(turn, nativeItemId, emittedAt, emittedAt),
               status: "completed",
               completedAt: emittedAt,
-              title: "notify",
-              type: "dynamic_tool",
-              toolName: "notify",
-              input: {
-                message,
-                notifyType: recordString(event, "notifyType") ?? "info",
-              },
+              title: message,
+              type: "system_notice",
+              message,
             },
           });
           return;
