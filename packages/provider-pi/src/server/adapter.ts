@@ -334,6 +334,8 @@ interface PiStreamItemState {
   text: string;
   completed: boolean;
   flushScheduled: boolean;
+  /** Set once the item has been shown; later deltas are batched. */
+  emitted: boolean;
   readonly startedAt: DateTime.Utc;
 }
 
@@ -555,7 +557,6 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         ReadonlyArray<OrchestrationV2PendingBackgroundTask>
       >();
       let backgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask> = [];
-      let registeringState: PiThreadState | null = null;
       let rollbackBarrier: Deferred.Deferred<
         void,
         ProviderAdapter.ProviderAdapterProtocolError
@@ -575,6 +576,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       let appliedModel: string | null = null;
       let appliedThinking: string | null = null;
       let appliedSessionName: string | null = null;
+      /**
+       * Set after a rollback forks the session: the next registration reloads
+       * the fork through `switch_session` even though Pi already reports it.
+       */
+      let sessionReloadRequired = false;
       const outOfTurnExtensionErrors: Array<PiRpcRecord> = [];
       let lastKnownLeaf: string | null = null;
       /**
@@ -950,12 +956,20 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       const scheduleStreamFlush = (turn: ActivePiTurn, item: PiStreamItemState) =>
         Effect.gen(function* () {
           if (item.flushScheduled || item.completed) return;
+          // The first visible text goes out at once: waiting a flush window
+          // only delays time-to-first-output. Batching covers the rest.
+          if (!item.emitted && item.text.length > 0) {
+            item.emitted = true;
+            return yield* emitStreamItem(turn, item, true);
+          }
           item.flushScheduled = true;
           yield* Effect.sleep(Duration.millis(STREAM_FLUSH_MS)).pipe(
             Effect.andThen(
               Effect.suspend(() => {
                 item.flushScheduled = false;
-                return item.completed ? Effect.void : emitStreamItem(turn, item, true);
+                if (item.completed) return Effect.void;
+                item.emitted = true;
+                return emitStreamItem(turn, item, true);
               }),
             ),
             Effect.forkIn(scope),
@@ -977,6 +991,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           text: "",
           completed: false,
           flushScheduled: false,
+          emitted: false,
           startedAt,
         };
         turn.streamItems.set(nativeItemId, item);
@@ -1676,9 +1691,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (tasks.length === 0) backgroundTasksBySource.delete(source);
         else backgroundTasksBySource.set(source, tasks);
         backgroundTasks = mergePiBackgroundTasks(backgroundTasksBySource);
-        // Before or during registration, registerThread applies the list.
-        if (threadState !== null && threadState !== registeringState)
-          yield* publishBackgroundTasks(threadState);
+        // Before registration, registerThread applies the list.
+        if (threadState !== null) yield* publishBackgroundTasks(threadState);
       });
 
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
@@ -2202,6 +2216,70 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         Effect.forkIn(scope),
       );
 
+      /**
+       * `get_entries` reports the session's current leaf whatever `since` is,
+       * so a known entry keeps the listing small. Pi rejects an unknown
+       * `since`; only then is the whole tree requested.
+       */
+      const readSessionLeaf = (since: string | null) => {
+        const full = request({ type: "get_entries" });
+        return (
+          since === null
+            ? full
+            : request({ type: "get_entries", since }).pipe(
+                Effect.catchTags({ PiRpcError: () => full }),
+              )
+        ).pipe(Effect.orElseSucceed(() => undefined));
+      };
+
+      /**
+       * A model, thinking, or policy change makes the orchestrator resume the
+       * thread this process already hosts. `switch_session` would rebuild Pi's
+       * whole runtime (every extension factory and session hook) and reset
+       * the applied selection, only to land on the same file. When Pi
+       * confirms it is still on that file, keep the binding and the applied
+       * state, and let `applySelection` send only what changed. Returns null
+       * when the full lifecycle path must run instead.
+       */
+      const rebindCurrentSession = Effect.fnUntraced(function* (
+        existing: OrchestrationV2ProviderThread,
+        sessionFile: string,
+      ) {
+        const stateData = yield* request({ type: "get_state" }, 2_000).pipe(
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (stateData === undefined || recordString(stateData, "sessionFile") !== sessionFile) {
+          return null;
+        }
+        // Adopt what Pi reports, so a selection an extension changed behind
+        // our back is still corrected. Null keeps meaning "Pi's own default"
+        // only while Pi still reports that default.
+        const stateModel = recordField(stateData, "model");
+        const provider = recordString(stateModel, "provider");
+        const modelId = recordString(stateModel, "id");
+        const currentModel =
+          provider === undefined || modelId === undefined ? null : `${provider}/${modelId}`;
+        const baselineSlug =
+          baselineModel === null ? null : `${baselineModel.provider}/${baselineModel.modelId}`;
+        if (appliedModel !== null || currentModel !== baselineSlug) appliedModel = currentModel;
+        const currentThinking = recordString(stateData, "thinkingLevel") ?? null;
+        if (appliedThinking !== null || currentThinking !== baselineThinking)
+          appliedThinking = currentThinking;
+        appliedSessionName = recordString(stateData, "sessionName") ?? null;
+        contextWindow = rememberModelContextWindow(stateModel);
+        const updatedAt = yield* DateTime.now;
+        const providerThread: OrchestrationV2ProviderThread = {
+          ...existing,
+          providerSessionId: input.providerSessionId,
+          nativeThreadRef: providerRef(sessionFile),
+          status: "idle",
+          pendingBackgroundTasks: backgroundTasks,
+          updatedAt,
+        };
+        threadState = { providerThread, activeTurn: null };
+        return providerThread;
+      });
+
       const registerThread = Effect.fnUntraced(function* (
         threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
         publish = true,
@@ -2228,6 +2306,27 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         }
         const existing = threadInput.existingProviderThread;
         const resumeId = existing?.nativeThreadRef?.nativeId;
+        const bound = threadState;
+        if (
+          existing !== undefined &&
+          resumeId != null &&
+          bound !== null &&
+          !sessionReloadRequired &&
+          resumeId === lastNativeThreadId &&
+          bound.providerThread.nativeThreadRef?.nativeId === resumeId &&
+          bound.providerThread.appThreadId === threadInput.threadId
+        ) {
+          const rebound = yield* rebindCurrentSession(existing, resumeId);
+          if (rebound !== null) {
+            if (publish)
+              yield* emit({
+                type: "provider_thread.updated",
+                driver: PI_PROVIDER,
+                providerThread: rebound,
+              });
+            return rebound;
+          }
+        }
         const needsNewSession = resumeId == null && registrationAttempted;
         registrationAttempted = true;
         if (resumeId != null || needsNewSession) {
@@ -2256,17 +2355,34 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             return yield* protocolError("A Pi extension cancelled the session switch");
           }
         }
-        const stateData = yield* request({ type: "get_state" });
-        if (!modelsDiscovered) {
-          const modelsData = yield* request({ type: "get_available_models" }).pipe(
-            Effect.orElseSucceed(() => undefined),
-          );
-          const models = recordField(modelsData, "models");
-          if (Array.isArray(models)) {
-            for (const model of models) rememberModelContextWindow(model);
-            modelsDiscovered = true;
-          }
-        }
+        // Pi answers these reads synchronously, in order, within one tick,
+        // and responses are correlated by id, so they share a round trip
+        // without native output interleaving. A failed get_state interrupts
+        // the others; their late replies are ignored by the event pump.
+        const [stateData, , baselineEntries] = yield* Effect.all(
+          [
+            request({ type: "get_state" }),
+            modelsDiscovered
+              ? Effect.void
+              : request({ type: "get_available_models" }).pipe(
+                  Effect.map((modelsData) => {
+                    const models = recordField(modelsData, "models");
+                    if (Array.isArray(models)) {
+                      for (const model of models) rememberModelContextWindow(model);
+                      modelsDiscovered = true;
+                    }
+                  }),
+                  Effect.ignore,
+                ),
+            // Only the leaf id is needed. The resumed file's last known head
+            // bounds the listing to what was appended since; the whole tree
+            // of a long session can be tens of megabytes.
+            readSessionLeaf(
+              resumeId == null ? null : (existing?.nativeConversationHeadRef?.nativeId ?? null),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
         contextWindow = rememberModelContextWindow(recordField(stateData, "model"));
         // Each baseline is captured independently, and only while nothing has
         // been applied yet, so a `get_state` that arrives after our own
@@ -2324,27 +2440,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 createdAt,
                 updatedAt: createdAt,
               };
+        // Background work reported while the reads ran is already in
+        // backgroundTasks: the thread is unbound until here, so it was held.
         const state: PiThreadState = { providerThread, activeTurn: null };
         threadState = state;
-        registeringState = state;
-        const baselineEntries = yield* request({ type: "get_entries" }).pipe(
-          Effect.orElseSucceed(() => undefined),
-        );
+        sessionReloadRequired = false;
         lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
         leafCursorStale = baselineEntries === undefined;
-        // Background work reported while get_entries ran lands here, not in a
-        // separate update that this thread's first publish would overwrite.
-        registeringState = null;
-        if (
-          !piBackgroundTasksEqual(
-            state.providerThread.pendingBackgroundTasks ?? [],
-            backgroundTasks,
-          )
-        )
-          state.providerThread = {
-            ...state.providerThread,
-            pendingBackgroundTasks: backgroundTasks,
-          };
         if (publish)
           yield* emit({
             type: "provider_thread.updated",
@@ -3022,6 +3124,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                           "Pi rollback ownership changed during its fork",
                         );
                       lastNativeThreadId = forkSessionFile;
+                      sessionReloadRequired = true;
                       appliedModel = null;
                       appliedThinking = null;
                       appliedSessionName = null;
