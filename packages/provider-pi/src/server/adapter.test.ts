@@ -1858,6 +1858,66 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect.each([
+    { delta: "text_delta", itemType: "assistant_message" },
+    { delta: "thinking_delta", itemType: "reasoning" },
+  ] as const)("shows the first $delta at once and batches the rest", ({ delta, itemType }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
+      const stream = (text: string) =>
+        fake.emit({
+          type: "message_update",
+          assistantMessageEvent: { type: delta, contentIndex: 0, delta: text },
+        });
+      const streamedText = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+        event.type === "turn_item.updated" &&
+        (event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning") &&
+        event.turnItem.type === itemType
+          ? event.turnItem.text
+          : undefined;
+      // A tool start is published as soon as the pump reaches it, so the
+      // events before it are exactly what the deltas published without the
+      // flush timer, which the test clock never fires on its own.
+      const textsBeforeMarker = Effect.fnUntraced(function* (toolCallId: string) {
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId,
+          toolName: "marker",
+          args: {},
+        });
+        const texts: Array<string> = [];
+        yield* takeEvent((event) => {
+          const text = streamedText(event);
+          if (text !== undefined) texts.push(text);
+          return (
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === toolCallId
+          );
+        });
+        return texts;
+      });
+
+      yield* stream("Hel");
+      assert.deepEqual(yield* textsBeforeMarker("marker-1"), ["Hel"]);
+      yield* stream("lo");
+      yield* stream(" world");
+      assert.deepEqual(yield* textsBeforeMarker("marker-2"), []);
+      yield* TestClock.adjust(Duration.millis(50));
+      const flushed = yield* takeEvent((event) => streamedText(event) !== undefined);
+      assert.equal(streamedText(flushed), "Hello world");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("presents explicitly namespaced MCP extension tools", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;

@@ -320,6 +320,8 @@ interface PiStreamItemState {
   text: string;
   completed: boolean;
   flushScheduled: boolean;
+  /** Set once the item has been shown; later deltas are batched. */
+  emitted: boolean;
   readonly startedAt: DateTime.Utc;
 }
 
@@ -921,12 +923,20 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       const scheduleStreamFlush = (turn: ActivePiTurn, item: PiStreamItemState) =>
         Effect.gen(function* () {
           if (item.flushScheduled || item.completed) return;
+          // The first visible text goes out at once: waiting a flush window
+          // only delays time-to-first-output. Batching covers the rest.
+          if (!item.emitted && item.text.length > 0) {
+            item.emitted = true;
+            return yield* emitStreamItem(turn, item, true);
+          }
           item.flushScheduled = true;
           yield* Effect.sleep(Duration.millis(STREAM_FLUSH_MS)).pipe(
             Effect.andThen(
               Effect.suspend(() => {
                 item.flushScheduled = false;
-                return item.completed ? Effect.void : emitStreamItem(turn, item, true);
+                if (item.completed) return Effect.void;
+                item.emitted = true;
+                return emitStreamItem(turn, item, true);
               }),
             ),
             Effect.forkIn(scope),
@@ -948,6 +958,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           text: "",
           completed: false,
           flushScheduled: false,
+          emitted: false,
           startedAt,
         };
         turn.streamItems.set(nativeItemId, item);
