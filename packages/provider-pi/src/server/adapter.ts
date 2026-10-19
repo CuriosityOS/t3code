@@ -112,6 +112,9 @@ const PiProviderCapabilitiesV2 = {
     // one immutable policy for its whole lifetime.
     supportsRuntimeModeSwitchInSession: false,
     pendingRequestsSurviveRestart: false,
+    // The resumed session file still holds the turn that asked, so a select or
+    // input dialog cut by a server restart is answered with a new message.
+    pendingUserInputAnswerableAfterRestart: true,
   },
   threads: {
     canCreateEmptyThread: true,

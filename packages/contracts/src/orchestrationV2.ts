@@ -196,6 +196,12 @@ export const OrchestrationV2SessionCapabilities = Schema.Struct({
   supportsProviderSwitchingViaHandoff: Schema.Boolean,
   supportsRuntimeModeSwitchInSession: Schema.Boolean,
   pendingRequestsSurviveRestart: Schema.Boolean,
+  /**
+   * A question still open when the server goes down stays open, and its answer
+   * reaches the resumed session as a new user message. Absent on snapshots
+   * that predate it.
+   */
+  pendingUserInputAnswerableAfterRestart: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2SessionCapabilities = typeof OrchestrationV2SessionCapabilities.Type;
 
@@ -1015,7 +1021,12 @@ export const OrchestrationV2RuntimeRequest = Schema.Struct({
   status: Schema.Literals(["pending", "resolved", "expired", "cancelled"]),
   responseCapability: Schema.Union([
     Schema.Struct({ type: Schema.Literal("live"), providerSessionId: ProviderSessionId }),
-    Schema.Struct({ type: Schema.Literal("message") }),
+    Schema.Struct({
+      type: Schema.Literal("message"),
+      // The turn that asked was waiting on this answer when the server
+      // restarted, so the answer is what resumes its work.
+      afterRestart: Schema.optional(Schema.Boolean),
+    }),
     Schema.Struct({ type: Schema.Literal("not_resumable"), reason: Schema.String }),
   ]),
   createdAt: Schema.DateTimeUtc,

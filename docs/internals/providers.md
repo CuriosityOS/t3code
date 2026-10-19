@@ -117,6 +117,13 @@ resumes a run, queues behind active work, or steers when the adapter supports it
 retain the provider's live response path. Do not infer that a request has disappeared merely because
 it is outside the recent history window.
 
+A blocking question normally expires with its provider process. A session whose capabilities set
+`pendingUserInputAnswerableAfterRestart` (Pi, whose session file keeps the turn that asked) instead
+keeps it open across a server restart: session release skips it on `server_shutdown`, and
+[restart recovery](../../apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts)
+converts it to `{ type: "message", afterRestart: true }` while cancelling the cut run. Its answer is
+the turn's continuation, so restart continuation does not also send "Continue where you left off."
+
 Native `/goal` state belongs to the provider and is mirrored on the provider thread. Codex starts
 the next goal turn on its own milliseconds after the last one completes, so the
 [adapter](../../apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts) keeps the run open

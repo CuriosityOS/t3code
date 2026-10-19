@@ -2,6 +2,7 @@ import { assert, it, vi } from "@effect/vitest";
 import {
   MessageId,
   NodeId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -12,6 +13,7 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -25,6 +27,8 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { ClaudeProviderCapabilitiesV2 } from "./Adapters/ClaudeAdapterV2.ts";
+import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 
 it.effect("leaves durable effects for the worker after runtime reconciliation", () =>
   Effect.gen(function* () {
@@ -228,6 +232,217 @@ it.effect("preserves async questions across startup and shutdown", () => {
     assert.isFalse(commitCommand.mock.calls.length > 0);
   }).pipe(Effect.provide(layer));
 });
+
+const cutQuestion = (capabilities: OrchestrationV2ProviderCapabilities) => {
+  const threadId = ThreadId.make("thread_cut_question");
+  const runId = RunId.make("run_cut_question");
+  const attemptId = RunAttemptId.make("attempt_cut_question");
+  const providerThreadId = ProviderThreadId.make("provider_thread_cut_question");
+  const providerSessionId = ProviderSessionId.make("session_cut_question");
+  const providerTurnId = ProviderTurnId.make("turn_cut_question");
+  const providerInstanceId = ProviderInstanceId.make("agent");
+  const driver = ProviderDriverKind.make("agent");
+  const rootNodeId = NodeId.make("node_cut_question_root");
+  const requestNodeId = NodeId.make("node_cut_question_request");
+  const requestId = RuntimeRequestId.make("request_cut_question");
+  const itemId = TurnItemId.make("item_cut_question");
+  const request = {
+    id: requestId,
+    nodeId: requestNodeId,
+    providerTurnId,
+    kind: "user_input",
+    status: "pending",
+    responseCapability: { type: "live", providerSessionId },
+    resolvedAt: null,
+  };
+  const projection = {
+    thread: {
+      id: threadId,
+      projectId: ProjectId.make("project_cut_question"),
+      providerInstanceId,
+      archivedAt: null,
+      deletedAt: null,
+    },
+    runtimeRequests: [request],
+    providerSessions: [
+      { id: providerSessionId, driver, providerInstanceId, status: "running", capabilities },
+    ],
+    providerThreads: [
+      {
+        id: providerThreadId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        driver,
+        providerInstanceId,
+        providerSessionId,
+        nativeThreadRef: { driver, nativeId: "native_cut_question", strength: "strong" },
+        status: "active",
+      },
+    ],
+    providerTurns: [
+      {
+        id: providerTurnId,
+        providerThreadId,
+        nodeId: rootNodeId,
+        runAttemptId: attemptId,
+        ordinal: 1,
+        status: "running",
+      },
+    ],
+    runs: [
+      {
+        id: runId,
+        ordinal: 1,
+        status: "running",
+        providerInstanceId,
+        providerThreadId,
+        activeAttemptId: attemptId,
+        rootNodeId,
+      },
+    ],
+    attempts: [{ id: attemptId, runId, rootNodeId, status: "running" }],
+    nodes: [
+      { id: rootNodeId, runId, status: "running" },
+      { id: requestNodeId, runId, status: "waiting" },
+    ],
+    subagents: [],
+    messages: [],
+    turnItems: [
+      {
+        id: itemId,
+        runId,
+        nodeId: requestNodeId,
+        providerThreadId,
+        type: "user_input_request",
+        requestId,
+        status: "waiting",
+        questions: [{ id: "q", header: "Database", question: "Which database?", options: [] }],
+      },
+    ],
+  } as unknown as OrchestrationV2ThreadProjection;
+  return { projection, requestId, requestNodeId, rootNodeId, itemId, runId, providerTurnId };
+};
+
+const reconcileCutQuestion = (
+  capabilities: OrchestrationV2ProviderCapabilities,
+  trigger: "startup" | "shutdown",
+) => {
+  const fixture = cutQuestion(capabilities);
+  const commits: Array<Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0]> = [];
+  const layer = ProviderRuntimeRecovery.layer.pipe(
+    Layer.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getRecoveryThreadIds: () => Effect.succeed([fixture.projection.thread.id]),
+          getRuntimeRecoveryProjection: () => Effect.succeed(fixture.projection),
+        }),
+        Layer.mock(EventSink.EventSinkV2)({
+          commitCommand: (input) => {
+            commits.push(input);
+            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+          },
+        }),
+        IdAllocator.layer,
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+          runRecoveryOnce: Effect.succeed(false),
+        }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+        }),
+      ),
+    ),
+  );
+  return Effect.gen(function* () {
+    const summary = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService.pipe(
+      Effect.flatMap((recovery) => recovery.reconcile(trigger)),
+      Effect.provide(layer),
+    );
+    assert.lengthOf(commits, 1);
+    const { events, effects } = commits[0]!;
+    const status = (id: string) =>
+      events.flatMap((event) =>
+        (event.type === "node.updated" ||
+          event.type === "turn-item.updated" ||
+          event.type === "provider-turn.updated") &&
+        event.payload.id === id
+          ? [event.payload.status]
+          : [],
+      );
+    return {
+      ...fixture,
+      summary,
+      effects,
+      request: events.flatMap((event) =>
+        event.type === "runtime-request.updated" && event.payload.id === fixture.requestId
+          ? [event.payload]
+          : [],
+      ),
+      runStatus: events.flatMap((event) =>
+        event.type === "run.updated" && event.payload.id === fixture.runId
+          ? [event.payload.status]
+          : [],
+      ),
+      status,
+    };
+  });
+};
+
+const answerableAfterRestart = {
+  ...ClaudeProviderCapabilitiesV2,
+  sessions: {
+    ...ClaudeProviderCapabilitiesV2.sessions,
+    pendingUserInputAnswerableAfterRestart: true,
+  },
+} satisfies OrchestrationV2ProviderCapabilities;
+
+it.effect.each(["startup", "shutdown"] as const)(
+  "keeps a question the %s cut open when its session can take the answer as a message",
+  (trigger) =>
+    Effect.gen(function* () {
+      const result = yield* reconcileCutQuestion(answerableAfterRestart, trigger);
+      assert.deepEqual(
+        result.request.map((request) => ({
+          status: request.status,
+          responseCapability: request.responseCapability,
+          resolvedAt: request.resolvedAt,
+        })),
+        [
+          {
+            status: "pending",
+            responseCapability: { type: "message", afterRestart: true },
+            resolvedAt: null,
+          },
+        ],
+      );
+      assert.equal(result.summary.closedRequests, 0);
+      // The cut run ends; its question, and the card that shows it, stay open.
+      assert.deepEqual(result.runStatus, ["cancelled"]);
+      assert.deepEqual(result.status(result.rootNodeId), ["cancelled"]);
+      assert.deepEqual(result.status(result.providerTurnId), ["cancelled"]);
+      assert.deepEqual(result.status(result.requestNodeId), []);
+      assert.deepEqual(result.status(result.itemId), []);
+      // Its answer resumes the work, so no automatic continuation is queued.
+      assert.deepEqual(result.effects, []);
+    }),
+);
+
+it.effect.each([
+  ["Claude", ClaudeProviderCapabilitiesV2],
+  ["Codex", CodexProviderCapabilitiesV2],
+] as const)("still expires a %s question the restart cut", ([, capabilities]) =>
+  Effect.gen(function* () {
+    const result = yield* reconcileCutQuestion(capabilities, "startup");
+    assert.deepEqual(
+      result.request.map((request) => [request.status, request.responseCapability.type]),
+      [["expired", "not_resumable"]],
+    );
+    assert.equal(result.summary.closedRequests, 1);
+    assert.deepEqual(result.runStatus, ["cancelled"]);
+    assert.deepEqual(result.status(result.requestNodeId), ["cancelled"]);
+    assert.deepEqual(result.status(result.itemId), ["cancelled"]);
+  }),
+);
 
 it.effect("uses the same reconciliation path to cancel runtime requests during shutdown", () => {
   const threadId = ThreadId.make("thread_shutdown_requests");

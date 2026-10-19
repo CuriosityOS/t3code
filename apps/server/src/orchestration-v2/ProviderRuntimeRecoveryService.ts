@@ -228,16 +228,33 @@ export const make = Effect.gen(function* () {
         }
         runs.push(run);
       }
+      const sessionsById = new Map(
+        projection.providerSessions.map((session) => [session.id, session]),
+      );
+      // The provider process is gone, but its session can still take the
+      // answer as a new message, so the question stays open instead of expiring.
+      const answerableAfterRestart = projection.runtimeRequests.filter(
+        (request) =>
+          request.status === "pending" &&
+          request.kind === "user_input" &&
+          request.responseCapability.type === "live" &&
+          sessionsById.get(request.responseCapability.providerSessionId)?.capabilities.sessions
+            .pendingUserInputAnswerableAfterRestart === true,
+      );
       const messageRequestNodeIds = new Set(
         projection.runtimeRequests
           .filter(
             (request) =>
               request.status === "pending" && request.responseCapability.type === "message",
           )
+          .concat(answerableAfterRestart)
           .map((request) => request.nodeId),
       );
       const requests = projection.runtimeRequests.filter(
-        (request) => request.status === "pending" && request.responseCapability.type !== "message",
+        (request) =>
+          request.status === "pending" &&
+          request.responseCapability.type !== "message" &&
+          !answerableAfterRestart.includes(request),
       );
       // Delegated task rows, items and nodes stay open: the child settles them.
       const delegatedTaskNodeIds = new Set<string>([
@@ -350,6 +367,16 @@ export const make = Effect.gen(function* () {
             },
             resolvedAt: now,
           },
+        });
+      }
+      for (const request of answerableAfterRestart) {
+        events.push({
+          id: yield* allocateEventId(),
+          type: "runtime-request.updated",
+          threadId: projection.thread.id,
+          nodeId: request.nodeId,
+          occurredAt: now,
+          payload: { ...request, responseCapability: { type: "message", afterRestart: true } },
         });
       }
       for (const run of runs) {

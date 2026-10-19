@@ -515,6 +515,10 @@ function pendingThreadTitleGenerationEffect(
 
 const WORKSPACE_PREPARATION_INPUT = "Preparing workspace";
 
+// The resumed session still holds the tool call that asked, with no result.
+const RESTART_ANSWER_PREAMBLE =
+  "T3 Code restarted while your question was open, so the tool call that asked it ended without an answer.";
+
 function withoutPreparationResult(
   item: Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }>,
 ) {
@@ -7508,10 +7512,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: "The question for this request was not found.",
           });
         }
+        const afterRestart = runtimeRequest.responseCapability.afterRestart === true;
         const replies: string[] = [];
         for (const question of approvalTurnItem.questions) {
           const answer = command.answers?.[question.id];
-          if (typeof answer !== "string" || answer.trim().length === 0) {
+          const text = typeof answer === "string" ? answer.trim() : "";
+          // A cut input dialog can offer an empty value as an answer of its own.
+          const emptyDialogValue = afterRestart && answer === "";
+          if (text.length === 0 && !emptyDialogValue) {
             if (question.required === false) continue;
             return yield* new OrchestratorDispatchError({
               commandId: command.commandId,
@@ -7519,7 +7527,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               cause: "Answer each question before sending.",
             });
           }
-          replies.push(`${question.question}\n${answer.trim()}`);
+          replies.push(
+            afterRestart
+              ? `Answer to your earlier question “${question.question}”: ${text || "(empty)"}`
+              : `${question.question}\n${text}`,
+          );
         }
         if (replies.length === 0) {
           return yield* new OrchestratorDispatchError({
@@ -7567,7 +7579,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             commandId: command.commandId,
             threadId: command.threadId,
             messageId: MessageId.make(`async-answer:${command.requestId}`),
-            text: replies.join("\n\n"),
+            text: (afterRestart ? [RESTART_ANSWER_PREAMBLE, ...replies] : replies).join("\n\n"),
             attachments: [],
             createdBy: "user",
             creationSource: "server",

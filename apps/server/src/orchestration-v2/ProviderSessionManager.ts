@@ -636,6 +636,11 @@ export const layerWithOptions = (
             input.reason === "runtime_error"
               ? "Provider session failed before this runtime request was resolved."
               : "Provider session was closed before this runtime request was resolved.";
+          // Restart recovery reopens these as questions answered by message.
+          const questionsOutliveShutdown =
+            input.reason === "server_shutdown" &&
+            input.entry.runtime.providerSession.capabilities.sessions
+              .pendingUserInputAnswerableAfterRestart === true;
 
           const events: Array<OrchestrationV2DomainEvent> = [];
           for (const threadId of input.entry.attachedThreadIds) {
@@ -649,6 +654,7 @@ export const layerWithOptions = (
                 request.status === "pending" &&
                 request.responseCapability.type === "live" &&
                 request.responseCapability.providerSessionId === providerSessionId &&
+                !(questionsOutliveShutdown && request.kind === "user_input") &&
                 DateTime.isLessThanOrEqualTo(request.createdAt, input.releasedAt),
             );
 
