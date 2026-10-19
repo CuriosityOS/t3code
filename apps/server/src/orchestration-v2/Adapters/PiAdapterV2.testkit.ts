@@ -16,6 +16,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { ProviderAdapterDriverCreateError } from "@t3tools/provider-core/server/adapterDriver";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import type { OrchestratorV2ProviderReplayHarness } from "../testkit/ProviderReplayHarness.ts";
@@ -391,6 +392,10 @@ export function layer<E, R>(input: {
         TestProviderHost.layer().pipe(Layer.provide(NodeServices.layer)),
         NodeServices.layer,
         IdAllocator.layer,
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
       ),
     ),
   );

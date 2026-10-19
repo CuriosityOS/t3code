@@ -68,11 +68,18 @@ export function parsePiModelSlug(slug: string): { provider: string; modelId: str
   return { provider: slug.slice(0, separator), modelId: slug.slice(separator + 1) };
 }
 
+export interface PiRpcFrame {
+  readonly direction: "incoming" | "outgoing";
+  readonly record: PiRpcRecord;
+}
+
 export interface PiRpcSpawnOptions {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
   readonly cwd: string | undefined;
   readonly env: NodeJS.ProcessEnv;
+  /** Observes every decoded frame, responses included, before it is routed or written. */
+  readonly onFrame?: (frame: PiRpcFrame) => Effect.Effect<void>;
 }
 
 export interface PiRpcConnection {
@@ -263,8 +270,10 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
       yield* Queue.fail(events, error);
     });
 
+  const { onFrame } = options;
   const routeRecord = (record: PiRpcRecord) =>
     Effect.gen(function* () {
+      if (onFrame !== undefined) yield* onFrame({ direction: "incoming", record });
       if (record["type"] === "response" && typeof record["id"] === "string") {
         const pending = pendingRequests.get(record["id"]);
         if (pending !== undefined) {
@@ -388,6 +397,7 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   const send = (record: PiRpcRecord): Effect.Effect<void, PiRpcError> =>
     Effect.gen(function* () {
+      if (onFrame !== undefined) yield* onFrame({ direction: "outgoing", record });
       const accepted = yield* Queue.offer(
         outgoing,
         new TextEncoder().encode(`${encodeJsonLine(record)}\n`),

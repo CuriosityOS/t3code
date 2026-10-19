@@ -42,6 +42,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { parsePiCompactCommand, type PiCompactCommand } from "./commands.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -72,6 +73,7 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import { makePiRpcProtocolLogger } from "./nativeLogging.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -197,6 +199,7 @@ export interface PiAdapterV2Options {
       request: ProviderContinuationRequests.ProviderContinuationRequest,
     ) => Effect.Effect<void>;
   };
+  readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
 }
 
 function contentText(content: unknown): string {
@@ -481,11 +484,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         threadId: input.threadId,
         env: launch.env,
       });
+      const logFrame = makePiRpcProtocolLogger({
+        nativeEventLogger: options.nativeEventLogger,
+        providerInstanceId: options.instanceId,
+        providerSessionId: input.providerSessionId,
+        threadId: input.threadId,
+      });
       const connection: PiRpcConnection = yield* makePiRpcConnection({
         command: scopedLaunch.command,
         args: scopedLaunch.args,
         cwd,
         env: launch.env,
+        ...(logFrame === undefined ? {} : { onFrame: logFrame }),
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.mapError(
@@ -2999,11 +3009,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             });
             const nativeId = yield* Effect.scoped(
               Effect.gen(function* () {
+                const logForkFrame = makePiRpcProtocolLogger({
+                  nativeEventLogger: options.nativeEventLogger,
+                  providerInstanceId: options.instanceId,
+                  providerSessionId: input.providerSessionId,
+                  threadId: forkInput.targetThreadId,
+                });
                 const forkConnection = yield* makePiRpcConnection({
                   command: options.settings.binaryPath || "pi",
                   args: [...forkLaunch.args, "--fork", sourceFile],
                   cwd,
                   env: forkLaunch.env,
+                  ...(logForkFrame === undefined ? {} : { onFrame: logForkFrame }),
                 });
                 yield* Stream.fromQueue(forkConnection.events).pipe(
                   Stream.runDrain,
@@ -3231,6 +3248,7 @@ export type PiAdapterV2DriverEnv =
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | McpProviderSessions.McpProviderSessions
+  | ProviderEventLoggers.ProviderEventLoggers
   | ProviderHost.ProviderHost;
 
 export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2DriverEnv> = {
@@ -3241,11 +3259,15 @@ export const PiAdapterV2Driver: ProviderAdapterDriver<PiSettings, PiAdapterV2Dri
     function* (input: ProviderAdapterDriverCreateInput<PiSettings>) {
       const hostEnvironment = yield* HostProcess.Environment;
       const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makePiAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
         environment: yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
         continuationRequests,
+        ...(providerEventLoggers.native === undefined
+          ? {}
+          : { nativeEventLogger: providerEventLoggers.native }),
       });
     },
     (effect, input) =>
@@ -3269,11 +3291,15 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, PiAdapterV2Dr
     Effect.gen(function* () {
       const hostEnvironment = yield* HostProcess.Environment;
       const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makePiAdapterV2({
         instanceId: PI_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_PI_SETTINGS,
         environment: hostEnvironment,
         continuationRequests,
+        ...(providerEventLoggers.native === undefined
+          ? {}
+          : { nativeEventLogger: providerEventLoggers.native }),
       });
     }),
   );

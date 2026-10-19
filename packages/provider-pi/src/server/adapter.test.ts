@@ -35,6 +35,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { handoffBudget } from "@t3tools/provider-core/server/handoffBudget";
@@ -350,6 +351,10 @@ const makeAdapter = Effect.fnUntraced(function* (
         ...continuationRequests,
         take: Effect.never,
       }),
+      Effect.provideService(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
     );
   }
   return yield* makePiAdapterV2({
@@ -1363,6 +1368,111 @@ describe("PiAdapterV2", () => {
       assert.equal(spawn.env.T3_MCP_URL, "http://127.0.0.1:43123/mcp");
       assert.equal(spawn.env.T3_MCP_BEARER_TOKEN, "secret-pi-token");
       assert.equal(spawn.env.T3_PI_RUNTIME_MODE, "full-access");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("writes the session's RPC frames to the thread's native event log", () =>
+    Effect.gen(function* () {
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-pi-log"),
+        threadId: THREAD_ID,
+        providerSessionId: "mcp-session-pi-log",
+        providerInstanceId: PI_INSTANCE_ID,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer secret-pi-token",
+        browserToolsAvailable: false,
+      });
+      const fake = yield* makeFakePi;
+      const writes: Array<{ readonly event: unknown; readonly threadId: ThreadId | null }> = [];
+      const adapter = yield* PiAdapterV2Driver.create({
+        instanceId: PI_INSTANCE_ID,
+        displayName: undefined,
+        enabled: true,
+        environment: [],
+        config: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner),
+        Effect.provideService(HostProcess.Environment, { PI_TEST_API_KEY: "sk-env-secret" }),
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: () => Effect.void,
+          take: Effect.never,
+        }),
+        Effect.provideService(ProviderEventLoggers.ProviderEventLoggers, {
+          native: {
+            filePath: "/logs/provider/events.log",
+            write: (event, threadId) => Effect.sync(() => void writes.push({ event, threadId })),
+            close: () => Effect.void,
+          },
+          canonical: undefined,
+        }),
+      );
+      const runtime = yield* adapter.openSession({
+        threadId: THREAD_ID,
+        providerSessionId: SESSION_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(emitted, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Streamed reply" },
+      });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Streamed reply" },
+      });
+      yield* fake.emit({ type: "agent_settled" });
+      while ((yield* Queue.take(emitted)).type !== "turn.terminal") {}
+
+      assert.isTrue(writes.length > 0);
+      assert.isTrue(writes.every((write) => write.threadId === THREAD_ID));
+      const frames = writes.map(
+        (write) =>
+          (write.event as { readonly event: Record<string, unknown> }).event as {
+            readonly direction: string;
+            readonly method: string;
+            readonly command?: string;
+            readonly assistantEvent?: string;
+          },
+      );
+      const has = (
+        direction: string,
+        method: string,
+        extra?: (frame: (typeof frames)[0]) => boolean,
+      ) =>
+        frames.some(
+          (frame) =>
+            frame.direction === direction && frame.method === method && (extra?.(frame) ?? true),
+        );
+      assert.isTrue(has("outgoing", "get_state"));
+      assert.isTrue(has("outgoing", "prompt"));
+      assert.isTrue(has("incoming", "response", (frame) => frame.command === "get_state"));
+      assert.isTrue(has("incoming", "agent_start"));
+      assert.isTrue(
+        has("incoming", "message_update", (frame) => frame.assistantEvent === "text_end"),
+      );
+      assert.isFalse(frames.some((frame) => frame.assistantEvent === "text_delta"));
+      assert.include(writes[0]!.event as object, {
+        provider: PI_PROVIDER,
+        protocol: "pi.rpc-jsonl",
+        providerSessionId: SESSION_ID,
+      });
+      const serialized = JSON.stringify(writes);
+      for (const secret of ["secret-pi-token", "sk-env-secret", "Hello pi", "Streamed reply"]) {
+        assert.notInclude(serialized, secret);
+      }
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
