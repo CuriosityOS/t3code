@@ -1156,6 +1156,148 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
+  it.effect.each([
+    ["Postgres", "Postgres"],
+    ["", "(empty)"],
+  ] as const)(
+    "sends the answer %j to a question a restart cut as a message that names it",
+    ([answer, answerText]) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const now = yield* DateTime.now;
+        const name = `runtime-restart-question-${answer.length}`;
+        const threadId = ThreadId.make(name);
+        const requestId = RuntimeRequestId.make(`${name}-request`);
+        const nodeId = NodeId.make(`${name}-node`);
+        const itemId = TurnItemId.make(`${name}-item`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${name}-create`),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          projectId: ProjectId.make(`${name}-project`),
+          title: "Restart question",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+        });
+        yield* eventSink.write({
+          commandId: CommandId.make(`${name}-seed`),
+          events: [
+            {
+              id: EventId.make(`${name}-node-event`),
+              type: "node.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: nodeId,
+                threadId,
+                runId: null,
+                parentNodeId: null,
+                rootNodeId: nodeId,
+                kind: "user_input_request",
+                status: "waiting",
+                countsForRun: false,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                runtimeRequestId: requestId,
+                checkpointScopeId: null,
+                startedAt: now,
+                completedAt: null,
+              },
+            },
+            {
+              id: EventId.make(`${name}-request-event`),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: requestId,
+                nodeId,
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "user_input",
+                status: "pending",
+                responseCapability: { type: "message", afterRestart: true },
+                createdAt: now,
+                resolvedAt: null,
+              },
+            },
+            {
+              id: EventId.make(`${name}-item-event`),
+              type: "turn-item.updated",
+              threadId,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: itemId,
+                type: "user_input_request",
+                threadId,
+                runId: null,
+                nodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "waiting",
+                title: "Database",
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+                requestId,
+                questions: [
+                  {
+                    id: "database",
+                    header: "Database",
+                    question: "Which database?",
+                    options: [
+                      { label: "Postgres", description: "Postgres", value: "Postgres" },
+                      { label: "SQLite", description: "SQLite", value: "SQLite" },
+                    ],
+                  },
+                ],
+              },
+            },
+          ],
+        });
+        const commandId = CommandId.make(`${name}-answer`);
+        yield* orchestrator.dispatch({
+          type: "runtime-request.respond",
+          commandId,
+          threadId,
+          requestId,
+          answers: { database: answer },
+        });
+        const answered = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(answered.runtimeRequests[0]?.status, "resolved");
+        assert.equal(answered.turnItems.find((item) => item.id === itemId)?.status, "completed");
+        assert.deepEqual(
+          answered.messages.map((message) => [message.role, message.text]),
+          [
+            [
+              "user",
+              `T3 Code restarted while your question was open, so the tool call that asked it ended without an answer.\n\nAnswer to your earlier question “Which database?”: ${answerText}`,
+            ],
+          ],
+        );
+        assert.lengthOf(answered.runs, 1);
+        assert.equal(answered.runs[0]?.userMessageId, answered.messages[0]?.id);
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(commandId)).map((effect) => effect.request),
+          [{ type: "provider-turn.start", runId: answered.runs[0]!.id }],
+        );
+      }),
+  );
+
   it.effect("dismisses message-capable questions directly and while settling", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
