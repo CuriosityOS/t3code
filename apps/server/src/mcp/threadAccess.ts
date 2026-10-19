@@ -103,8 +103,8 @@ export const assertTargetWithinLimits = (
   );
 
 /**
- * A thread caller acts only while it owns a live run, or a background
- * subagent that run started, of a thread that is not archived, so a provider
+ * A thread caller acts only while it owns a live run, or background work
+ * (such as a subagent) that run left waiting, of a thread that is not archived, so a provider
  * token that outlived its session cannot act. An OAuth client has no run; its
  * session and ceiling are its authority.
  */

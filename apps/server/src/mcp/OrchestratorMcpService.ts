@@ -60,6 +60,7 @@ import {
   type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
   normalizeThreadPullRequestKey,
@@ -209,10 +210,11 @@ function failure(code: OrchestratorMcpFailure["code"], message: string): Orchest
 
 /**
  * A caller's thread is live while it is not archived, runs on the caller's
- * provider instance, and has an active run or a background subagent that
- * instance started. A background subagent outlives its run and calls tools
- * with its thread's credential, which is revoked when the provider process
- * goes away.
+ * provider instance, and has an active run, a background subagent that
+ * instance started, or background work its provider waits on (for example a
+ * Pi extension's background terminal reporting back between runs). Such work
+ * outlives its run and calls tools with its thread's credential, which is
+ * revoked when the provider process goes away.
  */
 export const isLiveCallerShell = (
   shell: Pick<
@@ -225,8 +227,10 @@ export const isLiveCallerShell = (
   shell.archivedAt === null &&
   shell.providerInstanceId === providerInstanceId &&
   (shell.activeRunId !== null ||
-    (shell.pendingBackgroundTasks?.some(
-      (task) => task.kind === "subagent" && task.providerInstanceId === providerInstanceId,
+    (shell.pendingBackgroundTasks?.some((task) =>
+      task.kind === "subagent"
+        ? task.providerInstanceId === providerInstanceId
+        : backgroundWorkHoldsCompletion([task]),
     ) ??
       false));
 

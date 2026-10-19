@@ -1239,6 +1239,84 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("lists reported background work on its thread and keeps the session loaded", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      assert.strictEqual(runtime.backgroundTasksEndWithProcess, true);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      const reportTasks = (statusText: string | undefined) =>
+        fake.emit({
+          type: "extension_ui_request",
+          id: `status:${statusText}`,
+          method: "setStatus",
+          statusKey: "t3:background-tasks",
+          ...(statusText === undefined ? {} : { statusText }),
+        });
+      // Waits for the thread update carrying exactly this roster.
+      const expectRoster = (expected: ReadonlyArray<unknown>) =>
+        takeEvent(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            JSON.stringify(event.providerThread.pendingBackgroundTasks) ===
+              JSON.stringify(expected),
+        );
+
+      yield* reportTasks(JSON.stringify([{ taskId: "bg-1", description: "  pnpm build  " }]));
+      yield* expectRoster([{ taskId: "bg-1", kind: "background_task", description: "pnpm build" }]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+      assert.isFalse(
+        yield* runtime.hasPendingBackgroundWorkForThread!({
+          ...providerThread,
+          id: ProviderThreadId.make("other-provider-thread"),
+        }),
+      );
+
+      // A dev server the agent does not wait on is listed but does not pin.
+      yield* reportTasks(JSON.stringify([{ taskId: "dev", kind: "command" }]));
+      yield* expectRoster([{ taskId: "dev", kind: "command" }]);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+      yield* reportTasks("not a task list");
+      yield* reportTasks(JSON.stringify([{ taskId: "watch", kind: "monitor" }]));
+      yield* expectRoster([{ taskId: "watch", kind: "monitor" }]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+
+      yield* reportTasks(undefined);
+      yield* expectRoster([]);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("applies background work reported before its thread registers", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      yield* fake.emit({
+        type: "extension_ui_request",
+        id: "status:startup",
+        method: "setStatus",
+        statusKey: "t3:background-tasks",
+        statusText: JSON.stringify([{ taskId: "adopted", description: "chrome build" }]),
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      assert.deepEqual(providerThread.pendingBackgroundTasks, [
+        { taskId: "adopted", kind: "background_task", description: "chrome build" },
+      ]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each(["archive", "stop", "transport death"] as const)(
     "retiring a wake by %s cancels visible dialogs and invalidates its offer",
     (retirement) =>

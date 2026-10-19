@@ -27,6 +27,8 @@ const backgroundThreadId = ThreadId.make("thread:background");
 const oldProviderThreadId = ThreadId.make("thread:old-provider-background");
 const archivedThreadId = ThreadId.make("thread:archived-background");
 const unknownOwnerThreadId = ThreadId.make("thread:unknown-background-owner");
+const waitingTaskThreadId = ThreadId.make("thread:waiting-background-task");
+const commandOnlyThreadId = ThreadId.make("thread:command-only-background");
 
 const backgroundShell = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) => ({
   ...liveThreadShell(threadId, { activeRunId: null }),
@@ -57,6 +59,20 @@ const shells = new Map([
     {
       ...liveThreadShell(unknownOwnerThreadId, { activeRunId: null }),
       pendingBackgroundTasks: [{ taskId: "task:unknown", kind: "subagent" as const }],
+    },
+  ],
+  [
+    waitingTaskThreadId,
+    {
+      ...liveThreadShell(waitingTaskThreadId, { activeRunId: null }),
+      pendingBackgroundTasks: [{ taskId: "task:build", kind: "background_task" as const }],
+    },
+  ],
+  [
+    commandOnlyThreadId,
+    {
+      ...liveThreadShell(commandOnlyThreadId, { activeRunId: null }),
+      pendingBackgroundTasks: [{ taskId: "task:dev-server", kind: "command" as const }],
     },
   ],
 ]);
@@ -221,6 +237,10 @@ const background = threadCaller(backgroundThreadId);
 const oldProviderBackground = threadCaller(oldProviderThreadId);
 const archivedBackground = threadCaller(archivedThreadId);
 const unknownOwnerBackground = threadCaller(unknownOwnerThreadId);
+// Its turn ended, but it waits on background work it reports, such as a build.
+const waitingTask = threadCaller(waitingTaskThreadId);
+// Only work it does not wait on, such as a dev server, is left running.
+const commandOnly = threadCaller(commandOnlyThreadId);
 const mismatchedProvider = {
   ...background,
   thread: { ...background.thread!, providerInstanceId: ProviderInstanceId.make("claude") },
@@ -249,12 +269,16 @@ it.effect.each([
   ["acts_as_caller", mismatchedProvider, {}, "parent_not_active"],
   ["acts_as_caller", archivedBackground, {}, "parent_not_active"],
   ["acts_as_caller", unknownOwnerBackground, {}, "parent_not_active"],
+  ["acts_as_caller", waitingTask, {}, "ran"],
+  ["acts_as_caller", commandOnly, {}, "parent_not_active"],
   ["acts_as_caller", fullAccessClient, {}, "thread_credential_required"],
 
   ["writes", supervised, {}, "ran"],
   ["writes", ended, {}, "parent_not_active"],
   ["writes", background, {}, "ran"],
   ["writes", oldProviderBackground, {}, "parent_not_active"],
+  ["writes", waitingTask, {}, "ran"],
+  ["writes", commandOnly, {}, "parent_not_active"],
   ["writes", supervisedClient, {}, "ran"],
   ["writes", previewOnly, {}, "capability_denied"],
   ["writes_environment", previewOnly, {}, "capability_denied"],

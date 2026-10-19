@@ -9,6 +9,7 @@ import {
   type ChatAttachment,
   type ModelSelection,
   type OrchestrationV2ExecutionNode,
+  type OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   type OrchestrationV2ProviderRef,
@@ -24,6 +25,12 @@ import {
   type OrchestrationV2ProviderTurnTokenUsage,
 } from "@t3tools/contracts";
 import { PiSettings } from "../settings.ts";
+import {
+  parsePiBackgroundTasks,
+  PI_BACKGROUND_TASKS_STATUS_KEY,
+  piBackgroundTasksEqual,
+  piBackgroundTasksHoldSession,
+} from "./backgroundTasks.ts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -527,6 +534,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       let stopRequested = false;
       let unsolicitedActivityDetected = false;
       let pendingWake: PiWake | null = null;
+      // Process-wide: Pi runs one native session at a time, and its
+      // extensions report the work still running in that session.
+      let backgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask> = [];
+      let registeringState: PiThreadState | null = null;
       let rollbackBarrier: Deferred.Deferred<
         void,
         ProviderAdapter.ProviderAdapterProtocolError
@@ -1628,7 +1639,34 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         yield* connection.terminate;
       });
 
+      const publishBackgroundTasks = Effect.fnUntraced(function* (state: PiThreadState) {
+        if (
+          piBackgroundTasksEqual(state.providerThread.pendingBackgroundTasks ?? [], backgroundTasks)
+        )
+          return;
+        yield* updateProviderThread(state, { pendingBackgroundTasks: backgroundTasks });
+      });
+
+      const handleBackgroundTasksStatus = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        const tasks = parsePiBackgroundTasks(recordString(event, "statusText"));
+        if (tasks === null) {
+          yield* Effect.logWarning("Ignoring malformed pi background task status.");
+          return;
+        }
+        backgroundTasks = tasks;
+        // Before or during registration, registerThread applies the list.
+        if (threadState !== null && threadState !== registeringState)
+          yield* publishBackgroundTasks(threadState);
+      });
+
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
+        if (
+          event["type"] === "extension_ui_request" &&
+          event["method"] === "setStatus" &&
+          event["statusKey"] === PI_BACKGROUND_TASKS_STATUS_KEY
+        ) {
+          return yield* handleBackgroundTasksStatus(event);
+        }
         // Model-selection hooks can await a dialog before startTurn can claim
         // a wake. Keep interactive requests session-scoped until a turn owns
         // them; buffer native output and notifications for that turn.
@@ -2171,6 +2209,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const needsNewSession = resumeId == null && registrationAttempted;
         registrationAttempted = true;
         if (resumeId != null || needsNewSession) {
+          // Another native session has its own background work, which its
+          // extensions report again once the switch lands.
+          if (resumeId == null || resumeId !== lastNativeThreadId) backgroundTasks = [];
           lastNativeThreadId = resumeId ?? lastNativeThreadId;
           // Even a failed lifecycle operation can change Pi's native session.
           // Never leave the old app binding or model defaults usable afterward.
@@ -2234,6 +2275,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 nativeThreadRef: providerRef(nativeId),
                 ...(needsNewSession ? { nativeConversationHeadRef: null, contextUsage: null } : {}),
                 status: "idle",
+                pendingBackgroundTasks: backgroundTasks,
                 updatedAt: createdAt,
               }
             : {
@@ -2253,23 +2295,38 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 lastRunOrdinal: null,
                 handoffIds: [],
                 forkedFrom: null,
-                pendingBackgroundTasks: [],
+                pendingBackgroundTasks: backgroundTasks,
                 createdAt,
                 updatedAt: createdAt,
               };
-        threadState = { providerThread, activeTurn: null };
+        const state: PiThreadState = { providerThread, activeTurn: null };
+        threadState = state;
+        registeringState = state;
         const baselineEntries = yield* request({ type: "get_entries" }).pipe(
           Effect.orElseSucceed(() => undefined),
         );
         lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
         leafCursorStale = baselineEntries === undefined;
+        // Background work reported while get_entries ran lands here, not in a
+        // separate update that this thread's first publish would overwrite.
+        registeringState = null;
+        if (
+          !piBackgroundTasksEqual(
+            state.providerThread.pendingBackgroundTasks ?? [],
+            backgroundTasks,
+          )
+        )
+          state.providerThread = {
+            ...state.providerThread,
+            pendingBackgroundTasks: backgroundTasks,
+          };
         if (publish)
           yield* emit({
             type: "provider_thread.updated",
             driver: PI_PROVIDER,
-            providerThread,
+            providerThread: state.providerThread,
           });
-        return providerThread;
+        return state.providerThread;
       });
 
       const applySelection = Effect.fnUntraced(function* (modelSelection: ModelSelection) {
@@ -2360,11 +2417,20 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
+        hasPendingBackgroundWork: Effect.sync(
+          () => pendingWake !== null || piBackgroundTasksHoldSession(backgroundTasks),
+        ),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
-            () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
+            () =>
+              (pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id) ||
+              (threadState?.providerThread.id === providerThread.id &&
+                piBackgroundTasksHoldSession(backgroundTasks)),
           ),
+        // Extensions report what runs under this process. Once it exits
+        // nothing reports those tasks ending; the next process for the
+        // session reports again whatever it picks up.
+        backgroundTasksEndWithProcess: true,
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
