@@ -28,6 +28,7 @@ import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
 import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import packageJson from "../../package.json" with { type: "json" };
 import {
   ensurePinnedRuntimeInstalled,
   pinnedRuntimeCommand,
@@ -40,11 +41,29 @@ import { isExactServiceVersion, SERVICE_LAUNCHER_PROTOCOL } from "./serviceProto
 
 const PREFLIGHT_TIMEOUT = Duration.seconds(30);
 
+/**
+ * A server built from patched source carries `local` in its prerelease, as in
+ * `0.1.1-nightly.20261019.3348.local.1`. Updating it would install an official
+ * build over it and silently drop the patches, so it is updated by rebuilding
+ * from source instead.
+ */
+export function isLocalBuildVersion(version: string): boolean {
+  const prerelease = version.split("+")[0]?.split("-").slice(1).join("-") ?? "";
+  return prerelease.split(".").includes("local");
+}
+
+export const serverIsLocalBuild = isLocalBuildVersion(packageJson.version);
+
+export const LOCAL_BUILD_UPDATE_REASON =
+  "This server is a locally patched build. Updating it would replace it with an official build and drop the patches; rebuild it from source instead.";
+
 export function resolveServerSelfUpdateCapability(input: {
   readonly desktopManaged: boolean;
   readonly launcherManaged: boolean;
+  readonly localBuild?: boolean;
 }): ServerSelfUpdateCapability | null {
   if (input.desktopManaged) return "desktop-managed" as const;
+  if (input.localBuild === true) return null;
   return input.launcherManaged ? ("boot-service" as const) : null;
 }
 
@@ -187,8 +206,11 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   );
   const inFlight = yield* Ref.make(false);
 
-  const capability: ServerSelfUpdateCapability | null =
-    serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
+  const capability = resolveServerSelfUpdateCapability({
+    desktopManaged: serverConfig.mode === "desktop",
+    launcherManaged: launcher.managed,
+    localBuild: serverIsLocalBuild,
+  });
   const failWith = (reason: string, cause?: unknown) =>
     cause === undefined
       ? new ServerSelfUpdateError({ reason })
@@ -207,7 +229,9 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     }
     if (capability === null) {
       return yield* failWith(
-        "Remote updates require the T3 Code background service. Run `t3 service install` on the server machine.",
+        serverIsLocalBuild
+          ? LOCAL_BUILD_UPDATE_REASON
+          : "Remote updates require the T3 Code background service. Run `t3 service install` on the server machine.",
       );
     }
 
