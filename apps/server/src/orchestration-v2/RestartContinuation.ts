@@ -68,6 +68,17 @@ function restartContinuationBlocked(
           turn.id === request.providerTurnId)),
   );
   if (waitingRequest) return true;
+  // Answering the question the restart cut resumes the turn; continuing it
+  // without the answer would have the agent ask again.
+  const questionResumesTurn = projection.runtimeRequests.some(
+    (request) =>
+      request.status === "pending" &&
+      request.responseCapability.type === "message" &&
+      request.responseCapability.afterRestart === true &&
+      turn !== undefined &&
+      turn.id === request.providerTurnId,
+  );
+  if (questionResumesTurn) return true;
   return projection.turnItems.some(
     (item) =>
       item.type === "secret_request" &&

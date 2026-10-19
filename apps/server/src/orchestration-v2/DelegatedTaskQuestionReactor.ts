@@ -37,7 +37,8 @@ const make = Effect.gen(function* () {
     const key = `${task.threadId}:${request.id}`;
     const label = reportLabel(task.title?.trim() || task.prompt);
     const situation =
-      request.responseCapability.type === "message"
+      request.responseCapability.type === "message" &&
+      request.responseCapability.afterRestart !== true
         ? `Delegated task ${task.id} asked a question and is still working.`
         : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`;
     yield* engine.dispatch({

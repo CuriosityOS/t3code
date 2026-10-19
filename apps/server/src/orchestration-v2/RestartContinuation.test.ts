@@ -1176,6 +1176,9 @@ it.effect.each([
   ["user_input", "resolved", "live", true],
   ["command", "cancelled", "live", true],
   ["user_input", "pending", "message", true],
+  // Its answer is the continuation.
+  ["user_input", "pending", "message after restart", false],
+  ["user_input", "resolved", "message after restart", true],
   ["dynamic_tool_call", "pending", "live", true],
   ["auth_refresh", "pending", "live", true],
 ] as const)(
@@ -1195,7 +1198,9 @@ it.effect.each([
               ? { type: capability, providerSessionId: sessionId }
               : capability === "not_resumable"
                 ? { type: capability, reason: "The server restarted." }
-                : { type: capability },
+                : capability === "message after restart"
+                  ? { type: "message", afterRestart: true }
+                  : { type: capability },
         },
       ];
       const live = { ...base, runtimeRequests } as unknown as OrchestrationV2ThreadProjection;
@@ -1206,6 +1211,29 @@ it.effect.each([
       } as unknown as OrchestrationV2ThreadProjection;
       assert.lengthOf(yield* continuationTexts(cut), shouldContinue ? 1 : 0);
     }),
+);
+
+it.effect("continues a later turn past a question an earlier restart left open", () =>
+  Effect.gen(function* () {
+    const reopened = {
+      id: RuntimeRequestId.make("request:earlier-restart"),
+      nodeId: NodeId.make("node:earlier-restart-question"),
+      providerTurnId: ProviderTurnId.make("turn:earlier-restart"),
+      kind: "user_input",
+      status: "pending",
+      responseCapability: { type: "message", afterRestart: true },
+    };
+    const live = {
+      ...makeProjection(),
+      runtimeRequests: [reopened],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.equal(restartContinuationRun(live, now)?.id, runId);
+    const cut = {
+      ...cutMidTurn(),
+      runtimeRequests: [reopened],
+    } as unknown as OrchestrationV2ThreadProjection;
+    assert.deepEqual(yield* continuationTexts(cut), ["Continue where you left off."]);
+  }),
 );
 
 it.effect("does not wake a snoozed or settled thread, but continues once a snooze elapsed", () =>
